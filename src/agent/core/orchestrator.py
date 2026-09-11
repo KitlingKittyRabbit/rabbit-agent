@@ -132,6 +132,26 @@ class Orchestrator:
         )
         return conv
 
+    def rename_session(self, session_id: str, title: str) -> None:
+        conv = self.conversations.get(session_id)
+        if conv is None:
+            self.emit({"type": "error", "message": f"会话不存在: {session_id}"})
+            return
+        conv.title = title
+        if self.store is not None:
+            self.store.set_title(session_id, title)
+        self.emit({"type": "session_updated", "session": session_id, "title": title})
+
+    async def delete_session(self, session_id: str) -> None:
+        conv = self.conversations.pop(session_id, None)
+        if conv is None:
+            self.emit({"type": "error", "message": f"会话不存在: {session_id}"})
+            return
+        await conv.shutdown()
+        if self.store is not None:
+            self.store.delete_session(session_id)
+        self.emit({"type": "session_deleted", "session": session_id})
+
     def create_project(self, name: str, path: str) -> dict:
         root = Path(path).expanduser().resolve()
         if not root.is_dir():
@@ -192,6 +212,12 @@ class Orchestrator:
         elif msg_type == "new_session":
             self.create_session(
                 project_id=data.get("project") or None, title=str(data.get("title") or "")
+            )
+        elif msg_type == "rename_session":
+            self.rename_session(str(data.get("session", "")), str(data.get("title", "")))
+        elif msg_type == "delete_session":
+            asyncio.get_running_loop().create_task(
+                self.delete_session(str(data.get("session", "")))
             )
         elif msg_type == "create_project":
             result = self.create_project(

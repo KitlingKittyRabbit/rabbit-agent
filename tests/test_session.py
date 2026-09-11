@@ -58,6 +58,18 @@ def test_load_empty(tmp_path: Path) -> None:
     assert SessionStore(tmp_path / "s.db").load("any") == []
 
 
+def test_set_title_and_delete(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path / "s.db")
+    store.create_session("s1", "p1", "旧名")
+    store.append("s1", [Message(role="user", content="hi")])
+    store.set_title("s1", "新名")
+    assert store.list_sessions()[0]["title"] == "新名"
+    store.delete_session("s1")
+    assert store.list_sessions() == []
+    assert store.load("s1") == []
+    store.close()
+
+
 def test_migrate_drops_legacy_schema(tmp_path: Path) -> None:
     conn = sqlite3.connect(tmp_path / "s.db")
     conn.execute(

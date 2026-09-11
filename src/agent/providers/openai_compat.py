@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import AsyncIterator, Sequence
 
+import httpx2
 import openai
 
 from .base import (
@@ -46,6 +47,9 @@ class OpenAICompatProvider:
             client_kwargs["base_url"] = base_url
         if http_client is not None:
             client_kwargs["http_client"] = http_client
+        else:
+            # trust_env=False：不吃环境代理变量（桌面代理 socks:// 等会让 SDK 初始化崩溃）
+            client_kwargs["http_client"] = httpx2.AsyncClient(trust_env=False)
         self._client = openai.AsyncOpenAI(**client_kwargs)
 
     async def chat(

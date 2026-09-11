@@ -133,7 +133,8 @@ async def test_wizard_empty_key_aborts(monkeypatch) -> None:
 async def run_main(monkeypatch, inputs: list[str], events: list[dict] | None = None) -> FakeWS:
     ws = FakeWS(events=[SESSION_LIST, *(events or [])])
     run_inputs(monkeypatch, inputs)
-    monkeypatch.setattr(cli.websockets, "connect", lambda url: FakeConnect(ws))
+    monkeypatch.setattr(cli.websockets, "connect", lambda url, **kw: FakeConnect(ws))
+    monkeypatch.setattr(cli.webbrowser, "open", lambda url: None)
     await cli.main()
     return ws
 
@@ -206,6 +207,9 @@ async def test_connect_with_spawn_when_server_down(monkeypatch) -> None:
     spawned = []
 
     class FakeProc:
+        def poll(self):
+            return None  # 仍在运行
+
         def terminate(self):
             pass
 
@@ -213,7 +217,7 @@ async def test_connect_with_spawn_when_server_down(monkeypatch) -> None:
     attempts = {"n": 0}
     ws = FakeWS()
 
-    def fake_connect(url):
+    def fake_connect(url, **kw):
         attempts["n"] += 1
         if attempts["n"] == 1:
             raise OSError("refused")
@@ -232,7 +236,7 @@ async def test_connect_directly_when_server_running(monkeypatch) -> None:
     spawned = []
     monkeypatch.setattr(cli.subprocess, "Popen", lambda *a, **kw: spawned.append(1) or None)
     ws = FakeWS()
-    monkeypatch.setattr(cli.websockets, "connect", lambda url: FakeConnect(ws))
+    monkeypatch.setattr(cli.websockets, "connect", lambda url, **kw: FakeConnect(ws))
 
     result_ws, proc = await cli._connect_with_spawn()
     assert result_ws is ws
@@ -241,20 +245,45 @@ async def test_connect_directly_when_server_running(monkeypatch) -> None:
 
 
 async def test_connect_with_spawn_port_occupied_by_other_service(monkeypatch) -> None:
-    """用户报错回归：8000 被非 agent 服务占用 → 明确 SystemExit 而非栈 trace、不拉起。"""
+    """用户报错回归：持续握手失败 → 明确 SystemExit、不拉起（重试计数打零加速）。"""
     import websockets.exceptions
 
     spawned = []
     monkeypatch.setattr(cli.subprocess, "Popen", lambda *a, **kw: spawned.append(1) or None)
+    monkeypatch.setattr(cli, "_OCCUPIED_RETRIES", 2)
+    monkeypatch.setattr(cli, "_RETRY_INTERVAL", 0)
 
-    def fake_connect(url):
+    def fake_connect(url, **kw):
         raise websockets.exceptions.InvalidMessage("did not receive a valid HTTP response")
 
     monkeypatch.setattr(cli.websockets, "connect", fake_connect)
     with pytest.raises(SystemExit) as exc_info:
         await cli._connect_with_spawn()
-    assert "端口被占用" in str(exc_info.value)
+    assert "持续被占用" in str(exc_info.value)
     assert spawned == []  # 端口被占时不应拉起（拉起也绑不上）
+
+
+async def test_transient_handshake_failure_recovers(monkeypatch) -> None:
+    """瞬态握手失败（进程死亡窗口）应重试恢复，不误报占用。"""
+    import websockets.exceptions
+
+    monkeypatch.setattr(cli, "_RETRY_INTERVAL", 0)
+    ws = FakeWS()
+    attempts = {"n": 0}
+
+    def fake_connect(url, **kw):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise websockets.exceptions.InvalidMessage("transient")
+        return FakeConnect(ws)
+
+    spawned = []
+    monkeypatch.setattr(cli.subprocess, "Popen", lambda *a, **kw: spawned.append(1) or None)
+    monkeypatch.setattr(cli.websockets, "connect", fake_connect)
+
+    result_ws, proc = await cli._connect_with_spawn()
+    assert result_ws is ws
+    assert spawned == []  # 瞬态恢复，未拉起
 
 
 def test_server_url_reads_config_port(tmp_path: Path, monkeypatch) -> None:
@@ -266,6 +295,31 @@ def test_server_url_reads_config_port(tmp_path: Path, monkeypatch) -> None:
     )
     monkeypatch.setenv("AGENT_CONFIG", str(config))
     assert cli._server_url() == "ws://127.0.0.1:8471/ws"
+
+
+async def test_spawned_server_exits_immediately_reports(monkeypatch) -> None:
+    """拉起的 server 启动即死 → 明确报'已退出'，不与外人占用混淆（审核缺口补测）。"""
+    spawned = []
+
+    class DyingProc:
+        returncode = 1
+
+        def poll(self):
+            return 1  # 已退出
+
+        def terminate(self):
+            pass
+
+    monkeypatch.setattr(cli.subprocess, "Popen", lambda *a, **kw: spawned.append(1) or DyingProc())
+
+    def fake_connect(url, **kw):
+        raise OSError("refused")
+
+    monkeypatch.setattr(cli.websockets, "connect", fake_connect)
+    with pytest.raises(SystemExit) as exc_info:
+        await cli._connect_with_spawn()
+    assert "已退出" in str(exc_info.value)
+    assert spawned == [1]
 
 
 def test_server_url_fallback_default(monkeypatch) -> None:

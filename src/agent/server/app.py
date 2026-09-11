@@ -72,6 +72,24 @@ def create_app(orchestrator) -> FastAPI:
             args["limit"] = limit
         return await _call_read_tool(orchestrator, project, "read_file", args)
 
+    @app.get("/api/browse")
+    async def api_browse(path: str = Query(None)) -> JSONResponse:
+        """目录选择器用：列指定路径的子目录（仅目录，含 .. 父级）。默认家目录。"""
+        base = Path(path).expanduser() if path else Path.home()
+        try:
+            base = base.resolve()
+            if not base.is_dir():
+                return JSONResponse({"error": f"目录不存在: {base}"}, status_code=400)
+            dirs = sorted(
+                (p.name for p in base.iterdir() if p.is_dir() and not p.name.startswith(".")),
+                key=str.lower,
+            )
+        except PermissionError:
+            return JSONResponse({"error": f"无权限访问: {base}"}, status_code=400)
+        except OSError as e:
+            return JSONResponse({"error": str(e)}, status_code=400)
+        return JSONResponse({"path": str(base), "parent": str(base.parent), "dirs": dirs})
+
     return app
 
 

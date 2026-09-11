@@ -61,6 +61,15 @@ class SessionStore:
         ).fetchall()
         return [{"id": r[0], "project_id": r[1], "title": r[2], "created_at": r[3]} for r in rows]
 
+    def set_title(self, session_id: str, title: str) -> None:
+        self._conn.execute("UPDATE sessions SET title = ? WHERE id = ?", (title, session_id))
+        self._conn.commit()
+
+    def delete_session(self, session_id: str) -> None:
+        self._conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+        self._conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+        self._conn.commit()
+
     # ---- 消息表 ----
     def append(self, session_id: str, messages: list[Message]) -> None:
         self._conn.executemany(

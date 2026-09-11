@@ -75,6 +75,42 @@ async def test_project_session_isolation_in_store(tmp_path: Path) -> None:
     store.close()
 
 
+async def test_rename_session(tmp_path: Path) -> None:
+    db = tmp_path / "s.db"
+    orch = make_orch(tmp_path, store=SessionStore(db))
+    queue = orch.subscribe()
+    sid = next(iter(orch.conversations))
+    orch.handle_client_message({"type": "rename_session", "session": sid, "title": "改名了"})
+    event = await _until(queue, lambda e: e.get("type") == "session_updated")
+    assert event["title"] == "改名了"
+    assert orch.conversations[sid].title == "改名了"
+    assert SessionStore(db).list_sessions()[0]["title"] == "改名了"
+
+
+async def test_delete_session(tmp_path: Path) -> None:
+    db = tmp_path / "s.db"
+    orch = make_orch(tmp_path, store=SessionStore(db))
+    queue = orch.subscribe()
+    await orch.start()
+    try:
+        sid = next(iter(orch.conversations))
+        orch.handle_client_message({"type": "delete_session", "session": sid})
+        event = await _until(queue, lambda e: e.get("type") == "session_deleted")
+        assert event["session"] == sid
+        assert sid not in orch.conversations
+        assert SessionStore(db).list_sessions() == []
+    finally:
+        await orch.stop()
+
+
+async def test_delete_nonexistent_session(tmp_path: Path) -> None:
+    orch = make_orch(tmp_path)
+    queue = orch.subscribe()
+    orch.handle_client_message({"type": "delete_session", "session": "nope"})
+    event = await _until(queue, lambda e: e.get("type") == "error")
+    assert "不存在" in event["message"]
+
+
 # ---------- 项目管理消息 ----------
 
 

@@ -7,13 +7,13 @@ dependencies = [
     "openai>=1.50",
     "anthropic>=0.39",
     "fastapi>=0.115",
+    "httpx2>=2.12",
     "uvicorn[standard]>=0.30",
     "websockets>=13",
 ]
 
 [dependency-groups]
 dev = [
-    "httpx2>=2.12",
     "pytest>=8",
     "pytest-asyncio>=0.24",
     "ruff>=0.6",

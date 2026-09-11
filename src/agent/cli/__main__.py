@@ -21,6 +21,7 @@ import os
 import readline
 import subprocess
 import sys
+import webbrowser
 from pathlib import Path
 
 import websockets
@@ -105,6 +106,18 @@ async def _receive(ws, state: CliState) -> None:
             print(f"\n[错误] {event['message']}")
 
 
+def _web_url(ws_url: str) -> str:
+    return ws_url.replace("ws://", "http://").rsplit("/ws", 1)[0]
+
+
+def _open_browser(url: str) -> None:
+    """尽力打开浏览器；无显示环境（SSH/服务器）静默跳过。"""
+    try:
+        webbrowser.open(url)
+    except Exception:
+        pass
+
+
 def _server_url() -> str:
     """从 config.toml 读端口（与 server 同源）；读不到回落 8000。"""
     try:
@@ -114,41 +127,66 @@ def _server_url() -> str:
         return DEFAULT_SERVER_URL
 
 
-async def _connect_with_spawn(url: str = DEFAULT_SERVER_URL):
-    """先直连；连不上则自动拉起 server 并重试。返回 (ws, 子进程或 None)。
+_OCCUPIED_RETRIES = 40  # 握手失败重试次数（约 10 秒窗口，覆盖瞬态/慢启动/代理抽风）
+_RETRY_INTERVAL = 0.25
 
-    OSError（无人监听）→ 自动拉起；
-    WebSocketException（端口被非本 agent 的服务占用）→ 明确报错而非栈 trace。
+
+async def _try_connect(url: str):
+    """返回 (ws, transient)：成功 (ws, False)；无人监听 (None, False)；握手失败 (None, True)。
+
+    proxy=None：显式禁用 websockets 的系统代理探测，本机服务必须直连。
     """
     try:
-        return await websockets.connect(url), None
+        return await websockets.connect(url, proxy=None), False
     except OSError:
-        pass
-    except WebSocketException as e:
-        raise SystemExit(
-            f"端口被占用且不是本 agent 的 server（{type(e).__name__}）。请关闭占用程序后重试。"
-        ) from e
+        return None, False
+    except WebSocketException:
+        return None, True
+
+
+async def _connect_with_spawn(url: str = DEFAULT_SERVER_URL):
+    """先直连；连不上则自动拉起 server 并重试。返回 (ws, 子进程或 None)。"""
+    ws, transient = await _try_connect(url)
+    if transient:
+        # 端口上有东西但握手失败：瞬态（死亡窗口/慢启动/代理）与真占用用时间窗区分
+        for _ in range(_OCCUPIED_RETRIES):
+            await asyncio.sleep(_RETRY_INTERVAL)
+            ws, transient = await _try_connect(url)
+            if not transient:
+                break
+        if transient:
+            port = url.split(":")[2].split("/")[0]
+            raise SystemExit(
+                f"端口 {port} 持续被占用且握手失败（非本 agent 的 server）。"
+                f"请运行 ss -tlnp | grep :{port} 确认占用者后重试。"
+            )
+    if ws is not None:
+        return ws, None
     log = open("agent_server.log", "ab")
     proc = subprocess.Popen(
         [sys.executable, "-m", "agent.server"], stdout=log, stderr=subprocess.STDOUT
     )
     log.close()  # 子进程已继承 fd，父进程副本即刻关闭
     for _ in range(60):
-        try:
-            ws = await websockets.connect(url)
+        if proc.poll() is not None:
+            raise SystemExit(
+                f"自动拉起的 server 已退出（code {proc.returncode}），请查看 agent_server.log"
+            )
+        ws, _ = await _try_connect(url)
+        if ws is not None:
             print("（已自动拉起 server）")
             return ws, proc
-        except OSError:
-            await asyncio.sleep(0.25)
-        except WebSocketException as e:
-            proc.terminate()
-            raise SystemExit(f"端口被占用且不是本 agent 的 server（{type(e).__name__}）") from e
+        await asyncio.sleep(_RETRY_INTERVAL)
     proc.terminate()
     raise SystemExit("server 自动拉起失败，请查看 agent_server.log")
 
 
+_HISTORY_LIMIT = 500
+
+
 def _setup_readline() -> None:
     try:
+        readline.set_history_length(_HISTORY_LIMIT)  # 上限防历史文件病态膨胀
         if HISTORY_PATH.exists():
             readline.read_history_file(str(HISTORY_PATH))
         atexit.register(lambda: readline.write_history_file(str(HISTORY_PATH)))
@@ -157,7 +195,10 @@ def _setup_readline() -> None:
 
 
 async def _ask(loop, prompt: str) -> str:
-    return (await loop.run_in_executor(None, input, prompt)).strip()
+    try:
+        return (await loop.run_in_executor(None, input, prompt)).strip()
+    except EOFError:
+        return ""
 
 
 async def _pick(loop, options: list[str]) -> str | None:
@@ -217,7 +258,10 @@ async def _connect_wizard(ws, loop) -> None:
 
 
 async def _input_line(loop) -> str:
-    text = (await loop.run_in_executor(None, input, "> ")).rstrip("\n")
+    try:
+        text = (await loop.run_in_executor(None, input, "> ")).rstrip("\n")
+    except EOFError:
+        return "/quit"  # stdin 关闭（Ctrl+D / 管道结束）视为退出
     while text.endswith("\\"):
         more = await loop.run_in_executor(None, input, "| ")
         text = text[:-1] + "\n" + more
@@ -231,6 +275,9 @@ async def main() -> None:
     except OSError as e:
         print(f"无法连接 server（{e}）。")
         return
+    web_url = _web_url(_server_url())
+    print(f"web 界面: {web_url}（正在打开浏览器…）")
+    _open_browser(web_url)
     try:
         async with ws:
             await _chat_loop(ws)
