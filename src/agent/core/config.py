@@ -33,6 +33,7 @@ class AppConfig:
     session_db: str = ".agent_sessions.db"
     compact_threshold_chars: int = 200_000
     audit_log: str = ".agent_audit.log"
+    port: int = 8000
 
 
 def _parse_role(name: str, data: dict) -> RoleConfig:
@@ -66,6 +67,7 @@ def load_config(path: str | Path) -> AppConfig:
         session_db=str(agent.get("session_db", ".agent_sessions.db")),
         compact_threshold_chars=int(agent.get("compact_threshold_chars", 200_000)),
         audit_log=str(agent.get("audit_log", ".agent_audit.log")),
+        port=int(agent.get("port", 8000)),
     )
 
 

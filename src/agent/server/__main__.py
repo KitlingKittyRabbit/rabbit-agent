@@ -70,8 +70,8 @@ def main() -> None:
         projects=projects,
         projects_path=PROJECTS_PATH,
     )
-    logger.info("server 启动，工作目录 %s", config.working_dir)
-    uvicorn.run(create_app(orchestrator), host="127.0.0.1", port=8000)
+    logger.info("server 启动，工作目录 %s，端口 %s", config.working_dir, config.port)
+    uvicorn.run(create_app(orchestrator), host="127.0.0.1", port=config.port)
 
 
 if __name__ == "__main__":

@@ -4,6 +4,9 @@ import asyncio
 import builtins
 import getpass
 import json
+from pathlib import Path
+
+import pytest
 
 import agent.cli.__main__ as cli
 from agent.core.presets import PRESETS
@@ -235,3 +238,36 @@ async def test_connect_directly_when_server_running(monkeypatch) -> None:
     assert result_ws is ws
     assert spawned == []  # 未拉起
     assert proc is None
+
+
+async def test_connect_with_spawn_port_occupied_by_other_service(monkeypatch) -> None:
+    """用户报错回归：8000 被非 agent 服务占用 → 明确 SystemExit 而非栈 trace、不拉起。"""
+    import websockets.exceptions
+
+    spawned = []
+    monkeypatch.setattr(cli.subprocess, "Popen", lambda *a, **kw: spawned.append(1) or None)
+
+    def fake_connect(url):
+        raise websockets.exceptions.InvalidMessage("did not receive a valid HTTP response")
+
+    monkeypatch.setattr(cli.websockets, "connect", fake_connect)
+    with pytest.raises(SystemExit) as exc_info:
+        await cli._connect_with_spawn()
+    assert "端口被占用" in str(exc_info.value)
+    assert spawned == []  # 端口被占时不应拉起（拉起也绑不上）
+
+
+def test_server_url_reads_config_port(tmp_path: Path, monkeypatch) -> None:
+    config = tmp_path / "config.toml"
+    config.write_text(
+        '[agent]\nport = 8471\n\n[main]\nprotocol = "openai"\nmodel = "m"\n\n'
+        '[executor]\nprotocol = "openai"\nmodel = "m"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AGENT_CONFIG", str(config))
+    assert cli._server_url() == "ws://127.0.0.1:8471/ws"
+
+
+def test_server_url_fallback_default(monkeypatch) -> None:
+    monkeypatch.setenv("AGENT_CONFIG", "/nonexistent/config.toml")
+    assert cli._server_url() == cli.DEFAULT_SERVER_URL

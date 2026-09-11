@@ -17,16 +17,19 @@ import asyncio
 import atexit
 import getpass
 import json
+import os
 import readline
 import subprocess
 import sys
 from pathlib import Path
 
 import websockets
+from websockets.exceptions import WebSocketException
 
+from ..core.config import load_config
 from ..core.presets import PRESETS
 
-SERVER_URL = "ws://127.0.0.1:8000/ws"
+DEFAULT_SERVER_URL = "ws://127.0.0.1:8000/ws"
 HISTORY_PATH = Path(".agent_cli_history")
 HELP = """命令：
   /connect_provider   连接服务商向导
@@ -102,12 +105,29 @@ async def _receive(ws, state: CliState) -> None:
             print(f"\n[错误] {event['message']}")
 
 
-async def _connect_with_spawn():
-    """先直连；连不上则自动拉起 server 并重试。返回 (ws, 子进程或 None)。"""
+def _server_url() -> str:
+    """从 config.toml 读端口（与 server 同源）；读不到回落 8000。"""
     try:
-        return await websockets.connect(SERVER_URL), None
+        config = load_config(os.environ.get("AGENT_CONFIG", "config.toml"))
+        return f"ws://127.0.0.1:{config.port}/ws"
+    except Exception:
+        return DEFAULT_SERVER_URL
+
+
+async def _connect_with_spawn(url: str = DEFAULT_SERVER_URL):
+    """先直连；连不上则自动拉起 server 并重试。返回 (ws, 子进程或 None)。
+
+    OSError（无人监听）→ 自动拉起；
+    WebSocketException（端口被非本 agent 的服务占用）→ 明确报错而非栈 trace。
+    """
+    try:
+        return await websockets.connect(url), None
     except OSError:
         pass
+    except WebSocketException as e:
+        raise SystemExit(
+            f"端口被占用且不是本 agent 的 server（{type(e).__name__}）。请关闭占用程序后重试。"
+        ) from e
     log = open("agent_server.log", "ab")
     proc = subprocess.Popen(
         [sys.executable, "-m", "agent.server"], stdout=log, stderr=subprocess.STDOUT
@@ -115,11 +135,14 @@ async def _connect_with_spawn():
     log.close()  # 子进程已继承 fd，父进程副本即刻关闭
     for _ in range(60):
         try:
-            ws = await websockets.connect(SERVER_URL)
+            ws = await websockets.connect(url)
             print("（已自动拉起 server）")
             return ws, proc
         except OSError:
             await asyncio.sleep(0.25)
+        except WebSocketException as e:
+            proc.terminate()
+            raise SystemExit(f"端口被占用且不是本 agent 的 server（{type(e).__name__}）") from e
     proc.terminate()
     raise SystemExit("server 自动拉起失败，请查看 agent_server.log")
 
@@ -204,7 +227,7 @@ async def _input_line(loop) -> str:
 async def main() -> None:
     _setup_readline()
     try:
-        ws, spawned = await _connect_with_spawn()
+        ws, spawned = await _connect_with_spawn(_server_url())
     except OSError as e:
         print(f"无法连接 server（{e}）。")
         return

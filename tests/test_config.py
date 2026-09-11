@@ -55,6 +55,17 @@ def test_compact_threshold_default(tmp_path: Path) -> None:
     )
     config = load_config(write_config(tmp_path, toml))
     assert config.compact_threshold_chars == 200_000
+    assert config.port == 8000  # 缺省端口
+
+
+def test_custom_port(tmp_path: Path) -> None:
+    toml = (
+        "[agent]\nport = 8471\n\n"
+        '[main]\nprotocol = "openai"\nmodel = "m"\n\n'
+        '[executor]\nprotocol = "openai"\nmodel = "m"\n'
+    )
+    config = load_config(write_config(tmp_path, toml))
+    assert config.port == 8471
 
 
 def test_missing_file_raises() -> None:
