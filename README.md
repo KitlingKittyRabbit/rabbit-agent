@@ -21,10 +21,18 @@
 
 **上下文管理**：默认摘要压缩（B）——主上下文接近阈值时把旧历史压成 [前情摘要] 替换，只在 user 边界切割；兜底截断重试（A）——撞 ContextOverflowError 砍半重试 ≤2 次，subagent 仅享兜底
 
-**provider 层**：角色→provider 可配置；base_url + key + 协议三要素；覆盖 coding plan / 按量 API / Ollama
+**多会话**：会话注册表（id → 独立消息历史/驱动循环/任务表）；事件按 session_id 广播路由，多客户端各自订阅互不偷；SQLite 分会话持久化；CLI `/new`、`/sessions`、`/switch`
+
+**web 前端**：三栏 IDE 形态——左栏项目→会话树（多项目 `.projects.toml`），中栏对话流（markdown + 内联任务/提问/确认卡），右栏文件|任务页签（只读文件查看、subagent 实时步骤流）；浏览器开 `http://127.0.0.1:8000`
+
+**澄清通道**：subagent 遇规格歧义用 ask 工具回问（限时 300 秒），主 agent 用 answer_task 回答
+
+**运行与安全**：CLI 未检测到 server 时自动拉起；/stop 中断当前会话的 turn 与全部 subagent；危险 shell 命令需用户确认（超时自动拒）；写操作与 shell 落审计日志（JSONL）；token 用量与上下文水位随 turn 上报
+
+**provider 层**：角色→provider 可配置；base_url + key + 协议三要素；覆盖 coding plan / 按量 API / Ollama；`/connect_provider` 向导热切换不重启，状态存 .providers.toml；`uv run python -m agent.smoke` 真实连接体检（手动触发）
 
 **技术栈**：Python + FastAPI + SQLite，本地优先部署，第一个客户端为 CLI
 
 **MVP 切口**：一个主 agent + 一个执行 subagent + CLI，跑通"提示→主 agent 读/派→subagent 写→输出"闭环，含 plan 开关；探索 subagent 第二期
 
-**暂缓**：长期记忆、MCP、姥姥场景细化、任务取消
+**暂缓**：长期记忆、MCP、姥姥场景细化、探索 subagent、并行上限与任务面板、repo map、TUI/桌面前端

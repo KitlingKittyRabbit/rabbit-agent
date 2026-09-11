@@ -1,4 +1,4 @@
-"""编排器端到端测试：FakeProvider 全链路——派发、不阻塞、事件回注、纪律注入、plan 模式。"""
+"""编排器/会话端到端测试：闭环、多会话隔离、中断、plan 模式、压缩、广播。"""
 
 import asyncio
 from pathlib import Path
@@ -21,6 +21,14 @@ def _is_turn_end(event: dict) -> bool:
     return event.get("type") == "turn_end"
 
 
+def make_orch(tmp_path: Path, main, executor, **kwargs) -> Orchestrator:
+    return Orchestrator(main_provider=main, executor_provider=executor, root=tmp_path, **kwargs)
+
+
+def sid(orch: Orchestrator) -> str:
+    return next(iter(orch.conversations))
+
+
 async def test_full_closed_loop(tmp_path: Path) -> None:
     (tmp_path / "AGENTS.md").write_text("纪律全文：先批后落盘", encoding="utf-8")
     main = FakeProvider(
@@ -36,53 +44,194 @@ async def test_full_closed_loop(tmp_path: Path) -> None:
         ]
     )
     executor = FakeProvider([ChatResult(text="写完了，pytest 全绿")])
-    orch = Orchestrator(main_provider=main, executor_provider=executor, root=tmp_path)
+    orch = make_orch(tmp_path, main, executor)
+    queue = orch.subscribe()
     await orch.start()
     try:
-        orch.handle_client_message({"type": "user", "text": "帮我写 a.txt"})
+        session = sid(orch)
+        orch.handle_client_message({"type": "user", "session": session, "text": "帮我写 a.txt"})
 
-        await _until(orch.outbox, _is_turn_end)  # 第一轮结束（已派发）
-        update = await _until(
-            orch.outbox, lambda e: e.get("type") == "task_update" and e.get("status") == "done"
-        )
-        assert "写完了" in update["output"]
-        await _until(orch.outbox, _is_turn_end)  # 第二轮（事件回注后主 agent 汇报）
+        # subagent 可能在第一轮结束前就完成了：按序消费，不假设事件先后
+        done_update = None
+        turn_ends = 0
+
+        async def collect() -> None:
+            nonlocal done_update, turn_ends
+            while done_update is None or turn_ends < 2:
+                event = await queue.get()
+                if event.get("type") == "task_update" and event.get("status") == "done":
+                    done_update = event
+                elif event.get("type") == "turn_end":
+                    turn_ends += 1
+
+        await asyncio.wait_for(collect(), timeout=5)
+        assert "写完了" in done_update["output"]
+        assert done_update["session"] == session
     finally:
         await orch.stop()
 
-    # 主 agent 第三轮调用看到了回注的任务完成事件
     third_call = main.calls[2][0]
     assert any("[任务 #1 完成]" in m.content and "写完了" in m.content for m in third_call)
-    # executor 收到的正是派发的提示词
     assert executor.calls[0][0][-1].content == "写 a.txt"
-    # 主 agent 工具：有 call_subagent，无写工具、无 shell（物理缺席）
     main_tool_names = [t.name for t in main.calls[0][1]]
     assert "call_subagent" in main_tool_names
+    assert "answer_task" in main_tool_names
     assert "write_file" not in main_tool_names
     assert "run_shell" not in main_tool_names
-    # 项目纪律注入主 agent 系统提示词
     system = main.calls[0][0][0]
     assert system.role == "system"
     assert "先批后落盘" in system.content
-    # subagent 拿到完整工具
     executor_tool_names = [t.name for t in executor.calls[0][1]]
     assert "write_file" in executor_tool_names
     assert "run_shell" in executor_tool_names
+    assert "ask" in executor_tool_names  # 澄清通道工具
+
+
+async def test_multi_session_isolation(tmp_path: Path) -> None:
+    main = FakeProvider([ChatResult(text="会话一回复"), ChatResult(text="会话二回复")])
+    orch = make_orch(tmp_path, main, FakeProvider([ChatResult(text="x")]))
+    queue = orch.subscribe()
+    await orch.start()
+    try:
+        s1 = sid(orch)
+        s2 = orch.create_session(title="第二").id
+        orch.handle_client_message({"type": "user", "session": s1, "text": "一"})
+        await _until(queue, lambda e: e.get("type") == "turn_end" and e.get("session") == s1)
+        orch.handle_client_message({"type": "user", "session": s2, "text": "二"})
+        await _until(queue, lambda e: e.get("type") == "turn_end" and e.get("session") == s2)
+    finally:
+        await orch.stop()
+
+    conv1 = orch.conversations[s1]
+    conv2 = orch.conversations[s2]
+    assert [m.content for m in conv1._messages if m.role == "user"] == ["一"]
+    assert [m.content for m in conv2._messages if m.role == "user"] == ["二"]
+    # 两个会话的历史互不包含对方内容
+    assert main.calls[0][0][-1].content == "一"
+    assert all(m.content != "一" for m in main.calls[1][0])
+
+
+async def test_stop_interrupts_turn_and_subagents(tmp_path: Path) -> None:
+    gate = asyncio.Event()
+
+    class BlockingProvider:
+        async def chat(self, messages, tools=None, on_text=None):
+            await gate.wait()
+            return ChatResult(text="不应到达")
+
+    orch = make_orch(tmp_path, BlockingProvider(), FakeProvider([ChatResult(text="x")]))
+    queue = orch.subscribe()
+    await orch.start()
+    try:
+        session = sid(orch)
+        orch.handle_client_message({"type": "user", "session": session, "text": "跑"})
+        await asyncio.sleep(0.1)  # turn 已阻塞在 provider 调用上
+        orch.handle_client_message({"type": "stop", "session": session})
+        stopped = await _until(queue, lambda e: e.get("type") == "stopped")
+        assert stopped["session"] == session
+        await _until(queue, _is_turn_end)
+    finally:
+        await orch.stop()
+
+
+class BlockingProvider:
+    """永远阻塞的 provider（测试中断/shutdown 用）。"""
+
+    def __init__(self) -> None:
+        self.gate = asyncio.Event()
+
+    async def chat(self, messages, tools=None, on_text=None):
+        await self.gate.wait()
+        return ChatResult(text="不应到达")
+
+
+async def test_shutdown_during_turn_completes(tmp_path: Path) -> None:
+    """审核缺陷回归：turn 进行中 shutdown 必须能返回（driver 不挂死）。"""
+    orch = make_orch(tmp_path, BlockingProvider(), FakeProvider([ChatResult(text="x")]))
+    await orch.start()
+    orch.handle_client_message({"type": "user", "session": sid(orch), "text": "跑"})
+    await asyncio.sleep(0.1)  # turn 已阻塞
+    stop_task = asyncio.create_task(orch.stop())
+    # asyncio.wait 超时不取消任务：旧代码挂死时 pending 非空，断言必失败（真锁定）
+    done, pending = await asyncio.wait({stop_task}, timeout=2)
+    for task in pending:
+        task.cancel()
+    assert done, "shutdown 在 turn 进行中挂死"
+
+
+async def test_default_session_persisted_across_restarts(tmp_path: Path) -> None:
+    """审核缺陷回归：default 会话写 sessions 表，重启后历史仍在。"""
+    from agent.core.session import SessionStore
+
+    db = tmp_path / "s.db"
+    main = FakeProvider([ChatResult(text="第一句回复")])
+    orch = Orchestrator(
+        main_provider=main,
+        executor_provider=FakeProvider([ChatResult(text="x")]),
+        root=tmp_path,
+        store=SessionStore(db),
+    )
+    await orch.start()
+    first_id = sid(orch)
+    orch.handle_client_message({"type": "user", "session": first_id, "text": "记住我"})
+    await asyncio.sleep(0.2)
+    await orch.stop()
+
+    orch2 = Orchestrator(
+        main_provider=FakeProvider([ChatResult(text="y")]),
+        executor_provider=FakeProvider([ChatResult(text="z")]),
+        root=tmp_path,
+        store=SessionStore(db),
+    )
+    assert first_id in orch2.conversations
+    contents = [m.content for m in orch2.conversations[first_id]._messages]
+    assert "记住我" in contents
+
+
+async def test_confirm_allow_and_timeout(tmp_path: Path, monkeypatch) -> None:
+    import agent.core.conversation as conversation_mod
+
+    orch = make_orch(tmp_path, FakeProvider([ChatResult(text="x")]), FakeProvider([]))
+    queue = orch.subscribe()
+    conv = orch.conversations[sid(orch)]
+
+    # allow 路径：确认请求发出后被 resolve 为 True
+    task = asyncio.create_task(conv._confirm("rm -rf x"))
+    request = await _until(queue, lambda e: e.get("type") == "confirm_request")
+    orch.handle_client_message({"type": "confirm_response", "id": request["id"], "allow": True})
+    assert await task is True
+
+    # 超时路径：限时内无人回答自动拒绝
+    monkeypatch.setattr(conversation_mod, "_CONFIRM_TIMEOUT", 0.05)
+    assert await conv._confirm("rm -rf y") is False
+
+
+async def test_ask_timeout_returns_fallback(tmp_path: Path, monkeypatch) -> None:
+    import agent.core.dispatch as dispatch_mod
+    from agent.core.dispatch import Dispatcher
+
+    monkeypatch.setattr(dispatch_mod, "_ASK_TIMEOUT", 0.05)
+    events: list = []
+
+    async def spawn(task_id: int, prompt: str, extra_tools: list) -> str:
+        return await extra_tools[0].handler({"question": "没人理我"})
+
+    dispatcher = Dispatcher(spawn=spawn, on_event=events.append)
+    dispatcher.dispatch("干活")
+    await asyncio.sleep(0.3)
+    assert events[0].status == "done"
+    assert "自行判断" in events[0].output
 
 
 async def test_plan_mode_strips_write_and_shell_from_subagent(tmp_path: Path) -> None:
     executor = FakeProvider([ChatResult(text="只读探索结果")])
-    orch = Orchestrator(
-        main_provider=FakeProvider([ChatResult(text="x")]),
-        executor_provider=executor,
-        root=tmp_path,
-        plan_mode=True,
-    )
-    output = await orch._spawn_subagent("探索一下")
+    orch = make_orch(tmp_path, FakeProvider([ChatResult(text="x")]), executor, plan_mode=True)
+    conv = orch.conversations[sid(orch)]
+    output = await conv._spawn_subagent(1, "探索一下", [])
 
     assert output == "只读探索结果"
     tool_names = [t.name for t in executor.calls[0][1]]
-    assert tool_names == ["grep", "ls", "read_file"]
+    assert tool_names == ["glob", "grep", "ls", "read_file"]
 
 
 async def test_subagent_max_steps_marks_output(tmp_path: Path) -> None:
@@ -96,56 +245,86 @@ async def test_subagent_max_steps_marks_output(tmp_path: Path) -> None:
             ),
         ]
     )
-    orch = Orchestrator(
-        main_provider=FakeProvider([ChatResult(text="x")]),
-        executor_provider=executor,
-        root=tmp_path,
+    orch = make_orch(
+        tmp_path,
+        FakeProvider([ChatResult(text="x")]),
+        executor,
         max_steps_executor=1,
     )
-    output = await orch._spawn_subagent("干活")
+    conv = orch.conversations[sid(orch)]
+    output = await conv._spawn_subagent(1, "干活", [])
     assert "已达最大步数上限" in output
 
 
 async def test_set_plan_mode_ack(tmp_path: Path) -> None:
-    orch = Orchestrator(
-        main_provider=FakeProvider([ChatResult(text="x")]),
-        executor_provider=FakeProvider([ChatResult(text="y")]),
-        root=tmp_path,
-    )
+    orch = make_orch(tmp_path, FakeProvider([ChatResult(text="x")]), FakeProvider([]))
+    queue = orch.subscribe()
     orch.handle_client_message({"type": "set_plan_mode", "on": True})
-    event = orch.outbox.get_nowait()
+    event = queue.get_nowait()
     assert event == {"type": "plan_mode", "on": True}
     assert orch.plan_mode is True
 
 
+async def test_broadcast_reaches_all_subscribers(tmp_path: Path) -> None:
+    orch = make_orch(tmp_path, FakeProvider([ChatResult(text="x")]), FakeProvider([]))
+    q1 = orch.subscribe()
+    q2 = orch.subscribe()
+    orch.emit({"type": "plan_mode", "on": True})
+    assert q1.get_nowait()["type"] == "plan_mode"
+    assert q2.get_nowait()["type"] == "plan_mode"
+    orch.unsubscribe(q1)
+    orch.emit({"type": "plan_mode", "on": False})
+    assert q1.empty()
+    assert q2.get_nowait()["on"] is False
+
+
 async def test_compaction_replaces_old_history(tmp_path: Path) -> None:
     main = FakeProvider([ChatResult(text="这是摘要"), ChatResult(text="回复你")])
-    orch = Orchestrator(
-        main_provider=main,
-        executor_provider=FakeProvider([ChatResult(text="x")]),
-        root=tmp_path,
+    orch = make_orch(
+        tmp_path,
+        main,
+        FakeProvider([ChatResult(text="x")]),
         compact_threshold=250,
     )
-    orch._messages = [
+    conv = orch.conversations[sid(orch)]
+    conv._messages = [
         Message(role="user", content="旧消息" + "长" * 50),
         Message(role="assistant", content="短回复"),
     ]
+    queue = orch.subscribe()
     await orch.start()
     try:
-        orch.handle_client_message({"type": "user", "text": "新消息"})
-        await _until(orch.outbox, _is_turn_end)
+        conv.enqueue_user("新消息")
+        compacted = await _until(queue, lambda e: e.get("type") == "compacted")
+        assert compacted["before"] > compacted["after"]
+        await _until(queue, _is_turn_end)
     finally:
         await orch.stop()
 
-    # 第一次调用是压缩：提示词 + 序列化的旧历史
     compact_call = main.calls[0][0]
     assert "压缩为一份要点摘要" in compact_call[0].content
     assert "旧消息" in compact_call[0].content
-    # 第二次调用：旧历史已被 [前情摘要] 替换，recent 保留
     second_contents = [m.content for m in main.calls[1][0]]
     assert any("[前情摘要]" in c and "这是摘要" in c for c in second_contents)
     assert not any("长长长" in c for c in second_contents)
     assert any("短回复" in c for c in second_contents)
-    # 持久态同步整段替换
-    assert any("[前情摘要]" in m.content for m in orch._messages)
-    assert not any("长长长" in m.content for m in orch._messages)
+    assert any("[前情摘要]" in m.content for m in conv._messages)
+    assert not any("长长长" in m.content for m in conv._messages)
+
+
+async def test_usage_and_context_events(tmp_path: Path) -> None:
+    from agent.providers import Usage
+
+    main = FakeProvider([ChatResult(text="回复", usage=Usage(input_tokens=11, output_tokens=7))])
+    orch = make_orch(tmp_path, main, FakeProvider([ChatResult(text="x")]))
+    queue = orch.subscribe()
+    await orch.start()
+    try:
+        orch.handle_client_message({"type": "user", "session": sid(orch), "text": "hi"})
+        usage = await _until(queue, lambda e: e.get("type") == "usage")
+        assert usage["input"] == 11 and usage["output"] == 7
+        context = await _until(queue, lambda e: e.get("type") == "context")
+        assert context["chars"] > 0 and context["threshold"] == 200_000
+        await _until(queue, _is_turn_end)
+    finally:
+        await orch.stop()

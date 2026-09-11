@@ -7,6 +7,7 @@ max_steps_main = 50        # 主 agent 步数上限
 max_steps_executor = 30    # subagent 步数上限
 session_db = ".agent_sessions.db"
 compact_threshold_chars = 200000    # 主上下文压缩阈值（字符粗估），超过就把旧历史压成摘要
+audit_log = ".agent_audit.log"      # 写操作/shell 审计日志（JSONL）
 
 # 主 agent：顶尖模型（coding plan / 云端 API）
 [main]

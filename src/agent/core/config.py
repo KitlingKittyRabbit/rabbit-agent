@@ -32,6 +32,7 @@ class AppConfig:
     max_steps_executor: int = 30
     session_db: str = ".agent_sessions.db"
     compact_threshold_chars: int = 200_000
+    audit_log: str = ".agent_audit.log"
 
 
 def _parse_role(name: str, data: dict) -> RoleConfig:
@@ -64,6 +65,7 @@ def load_config(path: str | Path) -> AppConfig:
         max_steps_executor=int(agent.get("max_steps_executor", 30)),
         session_db=str(agent.get("session_db", ".agent_sessions.db")),
         compact_threshold_chars=int(agent.get("compact_threshold_chars", 200_000)),
+        audit_log=str(agent.get("audit_log", ".agent_audit.log")),
     )
 
 

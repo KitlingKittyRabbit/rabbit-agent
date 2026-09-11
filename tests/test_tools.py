@@ -126,8 +126,12 @@ async def test_shell_runs_in_working_dir(root: Path) -> None:
 
 
 async def test_shell_timeout_kills_process(root: Path) -> None:
+    import time
+
+    start = time.monotonic()
     output = await make_shell_tool(root).handler({"command": "sleep 5", "timeout": 0.2})
     assert "超时" in output
+    assert time.monotonic() - start < 2  # killpg：不等孤儿进程释放管道
 
 
 async def test_call_safe_turns_errors_into_text(root: Path) -> None:
@@ -138,8 +142,105 @@ async def test_call_safe_turns_errors_into_text(root: Path) -> None:
     assert "未知工具" in output
 
 
+async def test_read_file_offset_limit(root: Path) -> None:
+    (root / "lines.txt").write_text("\n".join(f"L{i}" for i in range(1, 11)), encoding="utf-8")
+    output = await read_registry(root).call(
+        "read_file", {"path": "lines.txt", "offset": 3, "limit": 2}
+    )
+    assert "L3\nL4" in output
+    assert "L5" not in output
+    assert "共 10 行" in output
+
+
+async def test_glob_finds_files(root: Path) -> None:
+    output = await read_registry(root).call("glob", {"pattern": "*.txt"})
+    assert "src/a.txt" in output
+    assert "b.md" not in output
+    assert await read_registry(root).call("glob", {"pattern": "*.zzz"}) == "(无匹配)"
+
+
+async def test_dangerous_command_confirm_flow(root: Path) -> None:
+    from agent.tools.shell_tool import is_dangerous, make_shell_tool
+
+    assert is_dangerous("rm -rf /")
+    assert is_dangerous("git push --force origin main")
+    assert not is_dangerous("rm file.txt")
+    assert not is_dangerous("git push origin main")
+    assert not is_dangerous("ls -la")
+
+    async def deny(cmd: str) -> bool:
+        return False
+
+    output = await make_shell_tool(root, confirm=deny).handler({"command": "rm -rf /tmp/x"})
+    assert "已被用户拒绝" in output
+
+    asked: list[str] = []
+
+    async def allow(cmd: str) -> bool:
+        asked.append(cmd)
+        return True
+
+    output = await make_shell_tool(root, confirm=allow).handler({"command": "echo hi"})
+    assert asked == []  # 非危险命令不触发确认
+    assert "hi" in output
+
+    output = await make_shell_tool(root, confirm=allow).handler({"command": "rm -rf 不存在目录"})
+    assert asked == ["rm -rf 不存在目录"]
+    assert "exit code" in output
+
+
+async def test_shell_cancel_kills_process(root: Path) -> None:
+    import asyncio
+    import time
+
+    import pytest
+
+    tool = make_shell_tool(root)
+    task = asyncio.create_task(tool.handler({"command": "sleep 30"}))
+    await asyncio.sleep(0.2)
+    start = time.monotonic()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert time.monotonic() - start < 2  # killpg：取消后不被孤儿进程拖住
+
+
+async def test_shell_cancel_uses_killpg(root: Path, monkeypatch) -> None:
+    """强锁定：取消路径必须调用 killpg（审核指出旧断言锁不住"只杀 sh 包装"）。"""
+    import asyncio
+
+    import pytest
+
+    import agent.tools.shell_tool as shell_tool_mod
+
+    calls: list[tuple] = []
+    original = shell_tool_mod.os.killpg
+
+    def spy(pid, sig):
+        calls.append((pid, sig))
+        return original(pid, sig)
+
+    monkeypatch.setattr(shell_tool_mod.os, "killpg", spy)
+
+    tool = make_shell_tool(root)
+    task = asyncio.create_task(tool.handler({"command": "sleep 30"}))
+    await asyncio.sleep(0.2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert calls, "取消路径未调用 killpg"
+
+
 async def test_build_registry_role_assembly(root: Path) -> None:
     read_only = build_registry(root, write=False, shell=False)
-    assert read_only.names() == ["grep", "ls", "read_file"]
+    assert read_only.names() == ["glob", "grep", "ls", "read_file"]
     full = build_registry(root, write=True, shell=True)
-    assert full.names() == ["edit_file", "grep", "ls", "read_file", "run_shell", "write_file"]
+    assert full.names() == [
+        "edit_file",
+        "glob",
+        "grep",
+        "ls",
+        "read_file",
+        "run_shell",
+        "write_file",
+    ]

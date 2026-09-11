@@ -18,6 +18,12 @@ class StubOrchestrator:
     async def stop(self) -> None:
         pass
 
+    def subscribe(self) -> asyncio.Queue:
+        return self.outbox
+
+    def unsubscribe(self, queue: asyncio.Queue) -> None:
+        pass
+
     def handle_client_message(self, data: dict) -> None:
         self.received.append(data)
         self.outbox.put_nowait({"type": "text_delta", "text": "回显:" + data.get("text", "")})

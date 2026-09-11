@@ -9,3 +9,7 @@ build/
 dist/
 .agent_sessions.db
 .providers.toml
+.projects.toml
+.agent_audit.log
+.agent_cli_history
+agent_server.log

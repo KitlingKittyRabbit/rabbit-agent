@@ -17,6 +17,10 @@ def make_orchestrator(tmp_path: Path, factory, store: bool = True) -> Orchestrat
     )
 
 
+def first_session(orch: Orchestrator) -> str:
+    return next(iter(orch.conversations))
+
+
 async def _until(queue: asyncio.Queue, pred, timeout: float = 5.0):
     async def _wait():
         while True:
@@ -37,7 +41,7 @@ async def test_connect_success_persists_and_hot_swaps(tmp_path: Path) -> None:
     result = await orch.connect_provider("main", **CONNECT)
 
     assert result["ok"] is True
-    assert orch._main_provider is fake
+    assert orch.main_provider is fake
     from agent.core.provider_store import load_providers
 
     stored = load_providers(tmp_path / ".providers.toml")
@@ -51,8 +55,8 @@ async def test_connect_executor_role(tmp_path: Path) -> None:
     orch = make_orchestrator(tmp_path, lambda **kw: fake)
     result = await orch.connect_provider("executor", **CONNECT)
     assert result["ok"] is True
-    assert orch._executor_provider is fake
-    assert orch._main_provider is None
+    assert orch.executor_provider is fake
+    assert orch.main_provider is None
 
 
 async def test_connect_failure_keeps_nothing(tmp_path: Path) -> None:
@@ -63,7 +67,7 @@ async def test_connect_failure_keeps_nothing(tmp_path: Path) -> None:
     assert result["ok"] is False
     assert "连接失败" in result["message"]
     assert not (tmp_path / ".providers.toml").exists()
-    assert orch._main_provider is None
+    assert orch.main_provider is None
 
 
 async def test_connect_invalid_config_not_saved(tmp_path: Path) -> None:
@@ -90,35 +94,36 @@ async def test_connect_without_store_path_is_runtime_only(tmp_path: Path) -> Non
     orch = make_orchestrator(tmp_path, lambda **kw: fake, store=False)
     result = await orch.connect_provider("main", **CONNECT)
     assert result["ok"] is True
-    assert orch._main_provider is fake
+    assert orch.main_provider is fake
     assert not (tmp_path / ".providers.toml").exists()
 
 
 async def test_chat_without_provider_gets_friendly_error(tmp_path: Path) -> None:
     orch = make_orchestrator(tmp_path, lambda **kw: FakeProvider([]))
+    queue = orch.subscribe()
     await orch.start()
     try:
-        orch.handle_client_message({"type": "user", "text": "你好"})
-        error = await _until(orch.outbox, lambda e: e.get("type") == "error")
+        orch.handle_client_message({"type": "user", "session": first_session(orch), "text": "你好"})
+        error = await _until(queue, lambda e: e.get("type") == "error")
         assert "未连接" in error["message"]
-        await _until(orch.outbox, lambda e: e.get("type") == "turn_end")
+        await _until(queue, lambda e: e.get("type") == "turn_end")
     finally:
         await orch.stop()
 
 
 async def test_spawn_subagent_without_executor_returns_hint(tmp_path: Path) -> None:
     orch = make_orchestrator(tmp_path, lambda **kw: FakeProvider([]))
-    output = await orch._spawn_subagent("干活")
+    conv = orch.conversations[first_session(orch)]
+    output = await conv._spawn_subagent(1, "干活", [])
     assert "未连接" in output
 
 
 async def test_connect_message_flows_to_provider_result(tmp_path: Path) -> None:
     fake = FakeProvider([ChatResult(text="pong")])
     orch = make_orchestrator(tmp_path, lambda **kw: fake)
-    orch.handle_client_message(
-        {"type": "connect_provider", "role": "main", **CONNECT},
-    )
-    result = await _until(orch.outbox, lambda e: e.get("type") == "provider_result")
+    queue = orch.subscribe()
+    orch.handle_client_message({"type": "connect_provider", "role": "main", **CONNECT})
+    result = await _until(queue, lambda e: e.get("type") == "provider_result")
     assert result["ok"] is True
     assert result["role"] == "main"
-    assert orch._main_provider is fake
+    assert orch.main_provider is fake

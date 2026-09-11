@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fnmatch
 import os
 import re
 from pathlib import Path
@@ -57,10 +58,28 @@ def make_read_tools(root: Path) -> list[Tool]:
             raise ToolError(f"文件不存在: {args['path']}")
         text = target.read_text(encoding="utf-8", errors="replace")
         lines = text.splitlines()
+        limit = args.get("limit")
+        if limit is not None:
+            offset = max(1, int(args.get("offset", 1)))
+            window = lines[offset - 1 : offset - 1 + int(limit)]
+            return "\n".join(window) + f"\n（第 {offset} 行起，共 {len(lines)} 行）"
         if len(lines) > _MAX_READ_LINES:
             head = "\n".join(lines[:_MAX_READ_LINES])
             return f"{head}\n...（截断：共 {len(lines)} 行，仅显示前 {_MAX_READ_LINES} 行）"
         return text
+
+    async def glob(args: dict) -> str:
+        pattern = args["pattern"]
+        base = _safe_path(root, args.get("path") or ".")
+        matches: list[str] = []
+        for file in _walk_files(base):
+            rel = str(file.relative_to(resolved_root))
+            if fnmatch.fnmatch(rel, pattern) or fnmatch.fnmatch(file.name, pattern):
+                matches.append(rel)
+                if len(matches) >= 200:
+                    matches.append("...（匹配过多，已截断）")
+                    break
+        return "\n".join(sorted(matches)) if matches else "(无匹配)"
 
     async def grep(args: dict) -> str:
         base = _safe_path(root, args.get("path") or ".")
@@ -97,16 +116,36 @@ def make_read_tools(root: Path) -> list[Tool]:
         Tool(
             ToolSpec(
                 name="read_file",
-                description="读取文件内容（超长截断）",
+                description="读取文件内容（可用 offset/limit 取行范围；超长截断）",
                 parameters={
                     "type": "object",
                     "properties": {
-                        "path": {"type": "string", "description": "相对工作目录的文件路径"}
+                        "path": {"type": "string", "description": "相对工作目录的文件路径"},
+                        "offset": {
+                            "type": "integer",
+                            "description": "起始行号（1 起），配合 limit 使用",
+                        },
+                        "limit": {"type": "integer", "description": "读取行数"},
                     },
                     "required": ["path"],
                 },
             ),
             read_file,
+        ),
+        Tool(
+            ToolSpec(
+                name="glob",
+                description="按通配符找文件（如 **/*.py），返回相对路径列表",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "pattern": {"type": "string", "description": "通配符模式"},
+                        "path": {"type": "string", "description": "搜索范围，默认整个工作目录"},
+                    },
+                    "required": ["pattern"],
+                },
+            ),
+            glob,
         ),
         Tool(
             ToolSpec(
