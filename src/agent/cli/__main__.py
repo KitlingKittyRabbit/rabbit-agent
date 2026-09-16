@@ -31,6 +31,7 @@ from ..core.config import load_config
 from ..core.presets import PRESETS
 
 DEFAULT_SERVER_URL = "ws://127.0.0.1:8000/ws"
+TOKEN_PATH = os.path.expanduser("~/.agent_token")
 HISTORY_PATH = Path(".agent_cli_history")
 HELP = """命令：
   /connect_provider   连接服务商向导
@@ -118,13 +119,33 @@ def _open_browser(url: str) -> None:
         pass
 
 
+def _read_token() -> str | None:
+    """读 ~/.agent_token；尚未生成/读失败/空内容都返回 None。"""
+    try:
+        token = Path(TOKEN_PATH).read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+    return token or None
+
+
+def _with_token(url: str, token: str | None) -> str:
+    base = url.split("?", 1)[0]
+    return f"{base}?token={token}" if token else base
+
+
+def _connect_url(url: str) -> str:
+    """每次连接前重读 token：自动拉起的 server 启动时会重写 ~/.agent_token。"""
+    return _with_token(url, _read_token())
+
+
 def _server_url() -> str:
-    """从 config.toml 读端口（与 server 同源）；读不到回落 8000。"""
+    """从 config.toml 读端口（与 server 同源），附带 ~/.agent_token；读不到回落 8000。"""
     try:
         config = load_config(os.environ.get("AGENT_CONFIG", "config.toml"))
-        return f"ws://127.0.0.1:{config.port}/ws"
+        base = f"ws://127.0.0.1:{config.port}/ws"
     except Exception:
         return DEFAULT_SERVER_URL
+    return _with_token(base, _read_token())
 
 
 _OCCUPIED_RETRIES = 40  # 握手失败重试次数（约 10 秒窗口，覆盖瞬态/慢启动/代理抽风）
@@ -145,17 +166,22 @@ async def _try_connect(url: str):
 
 
 async def _connect_with_spawn(url: str = DEFAULT_SERVER_URL):
-    """先直连；连不上则自动拉起 server 并重试。返回 (ws, 子进程或 None)。"""
-    ws, transient = await _try_connect(url)
+    """先直连；连不上则自动拉起 server 并重试。返回 (ws, 子进程或 None)。
+
+    每次尝试都重读 ~/.agent_token：自动拉起的 server 启动时会重写 token，
+    继续用旧 token 会被 403 拒绝（本函数按时间窗有界重试）。
+    """
+    base = url.split("?", 1)[0]
+    ws, transient = await _try_connect(_connect_url(base))
     if transient:
-        # 端口上有东西但握手失败：瞬态（死亡窗口/慢启动/代理）与真占用用时间窗区分
+        # 端口上有东西但握手失败：瞬态（死亡窗口/慢启动/代理/换 token）与真占用用时间窗区分
         for _ in range(_OCCUPIED_RETRIES):
             await asyncio.sleep(_RETRY_INTERVAL)
-            ws, transient = await _try_connect(url)
+            ws, transient = await _try_connect(_connect_url(base))
             if not transient:
                 break
         if transient:
-            port = url.split(":")[2].split("/")[0]
+            port = base.split(":")[2].split("/")[0]
             raise SystemExit(
                 f"端口 {port} 持续被占用且握手失败（非本 agent 的 server）。"
                 f"请运行 ss -tlnp | grep :{port} 确认占用者后重试。"
@@ -172,7 +198,7 @@ async def _connect_with_spawn(url: str = DEFAULT_SERVER_URL):
             raise SystemExit(
                 f"自动拉起的 server 已退出（code {proc.returncode}），请查看 agent_server.log"
             )
-        ws, _ = await _try_connect(url)
+        ws, _ = await _try_connect(_connect_url(base))
         if ws is not None:
             print("（已自动拉起 server）")
             return ws, proc
@@ -230,17 +256,19 @@ async def _connect_wizard(ws, loop) -> None:
         protocol = await _ask(loop, "protocol（openai/anthropic）: ")
         base_url = (await _ask(loop, "base_url: ")) or None
         model = await _ask(loop, "model: ")
-        needs_key = True
+        needs_key = False
+        optional_key = True  # 自定义端点 key 可留空（本地/无鉴权），由后端判定
     else:
         preset = PRESETS[choice]
         protocol = preset["protocol"]
         base_url = preset["base_url"]
         model = (await _ask(loop, f"model [{preset['model']}]: ")) or preset["model"]
         needs_key = preset["needs_key"]
+        optional_key = False
 
-    if needs_key:
+    if needs_key or optional_key:
         api_key = (await loop.run_in_executor(None, getpass.getpass, "API key（不回显）: ")).strip()
-        if not api_key:
+        if not api_key and needs_key:
             print("key 为空，已取消。")
             return
     else:

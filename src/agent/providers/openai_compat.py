@@ -13,6 +13,7 @@ from .base import (
     ChatResult,
     ContextOverflowError,
     Message,
+    OnReasoning,
     OnText,
     ProviderError,
     RateLimitError,
@@ -20,6 +21,7 @@ from .base import (
     ToolSpec,
     Usage,
 )
+from .listing import fetch_models
 
 _STOP_MAP = {"stop": "stop", "tool_calls": "tool_use", "length": "length"}
 
@@ -36,8 +38,14 @@ class OpenAICompatProvider:
         timeout: float = 600.0,
         max_retries: int = 0,
         http_client: object | None = None,
+        context_window: int | None = None,
+        reasoning_effort: str | None = None,
     ) -> None:
         self._model = model
+        self._base_url = base_url
+        self._api_key = api_key
+        self.context_window = context_window
+        self._reasoning_effort = reasoning_effort
         client_kwargs: dict = {
             "api_key": api_key,
             "timeout": timeout,
@@ -52,11 +60,16 @@ class OpenAICompatProvider:
             client_kwargs["http_client"] = httpx2.AsyncClient(trust_env=False)
         self._client = openai.AsyncOpenAI(**client_kwargs)
 
+    async def list_models(self) -> list[dict]:
+        """拉取 provider 真实模型列表（内存凭据，不进 URL/日志）。"""
+        return await fetch_models("openai", self._base_url, self._api_key)
+
     async def chat(
         self,
         messages: Sequence[Message],
         tools: Sequence[ToolSpec] | None = None,
         on_text: OnText | None = None,
+        on_reasoning: OnReasoning | None = None,
     ) -> ChatResult:
         kwargs: dict = {
             "model": self._model,
@@ -65,9 +78,11 @@ class OpenAICompatProvider:
         }
         if tools:
             kwargs["tools"] = [self._convert_tool(t) for t in tools]
+        if self._reasoning_effort and self._reasoning_effort != "off":
+            kwargs["reasoning_effort"] = self._reasoning_effort
         try:
             stream = await self._client.chat.completions.create(**kwargs)
-            return await self._consume(stream, on_text)
+            return await self._consume(stream, on_text, on_reasoning)
         except openai.AuthenticationError as e:
             raise AuthError(str(e), status_code=401) from e
         except openai.RateLimitError as e:
@@ -120,16 +135,21 @@ class OpenAICompatProvider:
             },
         }
 
-    async def _consume(self, stream: AsyncIterator, on_text: OnText | None) -> ChatResult:
+    async def _consume(
+        self, stream: AsyncIterator, on_text: OnText | None, on_reasoning: OnReasoning | None = None
+    ) -> ChatResult:
         text_parts: list[str] = []
+        reasoning_parts: list[str] = []
         tool_slots: dict[int, dict[str, str]] = {}
         finish: str | None = None
         usage = Usage()
         async for chunk in stream:
             if chunk.usage is not None:
+                details = getattr(chunk.usage, "completion_tokens_details", None)
                 usage = Usage(
                     input_tokens=chunk.usage.prompt_tokens or 0,
                     output_tokens=chunk.usage.completion_tokens or 0,
+                    reasoning_tokens=getattr(details, "reasoning_tokens", 0) or 0,
                 )
             if not chunk.choices:
                 continue
@@ -140,6 +160,12 @@ class OpenAICompatProvider:
                     text_parts.append(delta.content)
                     if on_text is not None:
                         on_text(delta.content)
+                # provider 明确返回的思考内容（DeepSeek/Kimi 等兼容字段）
+                reasoning_delta = getattr(delta, "reasoning_content", None)
+                if reasoning_delta:
+                    reasoning_parts.append(reasoning_delta)
+                    if on_reasoning is not None:
+                        on_reasoning(reasoning_delta)
                 if delta.tool_calls:
                     for tc in delta.tool_calls:
                         slot = tool_slots.setdefault(tc.index, {"id": "", "name": "", "args": ""})
@@ -158,6 +184,7 @@ class OpenAICompatProvider:
             tool_calls=tool_calls,
             stop_reason=_STOP_MAP.get(finish or "stop", "other"),
             usage=usage,
+            reasoning="".join(reasoning_parts),
         )
 
     @staticmethod

@@ -84,3 +84,72 @@ def test_migrate_drops_legacy_schema(tmp_path: Path) -> None:
     store.append("s1", [Message(role="user", content="新")])
     assert [m.content for m in store.load("s1")] == ["新"]
     store.close()
+
+
+def test_messages_persist_reasoning_and_content_blocks(tmp_path: Path) -> None:
+    """协议块（thinking+signature/tool_use 顺序）与 reasoning 完整入库并可恢复。"""
+    from agent.providers import Message, ToolCall
+
+    store = SessionStore(tmp_path / "s.db")
+    blocks = [
+        {"type": "thinking", "thinking": "先读", "signature": "sig-1"},
+        {"type": "text", "text": "我来看看"},
+        {"type": "tool_use", "id": "t1", "name": "read_file", "input": {"path": "a.py"}},
+    ]
+    messages = [
+        Message(role="user", content="修复 a.py"),
+        Message(
+            role="assistant", content="我来看看",
+            tool_calls=[ToolCall(id="t1", name="read_file", arguments={"path": "a.py"})],
+            reasoning="先读", content_blocks=blocks,
+        ),
+        Message(role="tool", content="内容", tool_call_id="t1"),
+    ]
+    store.append("s1", messages)
+    loaded = store.load("s1")
+    assert loaded[1].reasoning == "先读"
+    assert loaded[1].content_blocks == blocks  # 顺序与字段完全一致
+    store.close()
+
+
+def test_messages_invalid_blocks_json_degrades(tmp_path: Path) -> None:
+    """坏 JSON 的旧记录安全降级为 None，不阻塞读取。"""
+    store = SessionStore(tmp_path / "s.db")
+    store._conn.execute(
+        "INSERT INTO messages (session_id, role, content, content_blocks)"
+        " VALUES ('s1', 'assistant', 'x', '{not-json')"
+    )
+    store._conn.execute(
+        "INSERT INTO messages (session_id, role, content, tool_calls)"
+        " VALUES ('s1', 'assistant', 'y', '{bad')"
+    )
+    store._conn.commit()
+    loaded = store.load("s1")
+    assert len(loaded) == 2
+    assert loaded[0].content_blocks is None and loaded[1].tool_calls is None
+    store.close()
+
+
+def test_old_messages_table_migrates_columns_without_data_loss(tmp_path: Path) -> None:
+    """旧库 messages 无 reasoning/content_blocks：自动补列且不丢行。"""
+    import sqlite3
+
+    db = tmp_path / "s.db"
+    conn = sqlite3.connect(db)
+    conn.executescript(
+        """
+        CREATE TABLE sessions (id TEXT PRIMARY KEY, project_id TEXT NOT NULL DEFAULT '',
+            title TEXT NOT NULL DEFAULT '', created_at REAL NOT NULL);
+        CREATE TABLE messages (idx INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL, role TEXT NOT NULL,
+            content TEXT NOT NULL DEFAULT '', tool_calls TEXT, tool_call_id TEXT);
+        INSERT INTO messages (session_id, role, content) VALUES ('s1', 'user', '旧消息');
+        """
+    )
+    conn.commit()
+    conn.close()
+    store = SessionStore(db)
+    loaded = store.load("s1")
+    assert [m.content for m in loaded] == ["旧消息"]
+    assert loaded[0].reasoning is None and loaded[0].content_blocks is None
+    store.close()

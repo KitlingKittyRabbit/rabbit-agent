@@ -21,12 +21,42 @@ class ToolCall:
 
 @dataclass
 class Message:
-    """对话消息。tool_calls 仅 assistant 使用；tool_call_id 仅 tool 使用。"""
+    """对话消息。tool_calls 仅 assistant 使用；tool_call_id 仅 tool 使用。
+
+    reasoning 仅本地展示；content_blocks 保存 provider 原始有序内容块
+    （Anthropic thinking[含 signature]/text/tool_use），下一轮按协议原样回传。
+    """
 
     role: str  # "system" | "user" | "assistant" | "tool"
     content: str = ""
     tool_calls: list[ToolCall] | None = None
     tool_call_id: str | None = None
+    reasoning: str | None = None
+    content_blocks: list[dict] | None = None
+
+
+@dataclass(frozen=True)
+class ModelCapability:
+    """单个模型的能力（只来自 provider 元数据或用户覆盖，绝不按名称/协议猜）。"""
+
+    window: int | None = None
+    reasoning_returned: bool | None = None
+    reasoning_mode: str = "unknown"  # adjustable | fixed | none | unknown
+    levels: tuple[str, ...] | None = None
+    max_output: int | None = None
+    tools: bool | None = None
+    source: str = "unknown"  # provider | user | unknown
+
+    def as_dict(self) -> dict:
+        return {
+            "window": self.window,
+            "reasoning_returned": self.reasoning_returned,
+            "reasoning_mode": self.reasoning_mode,
+            "levels": list(self.levels) if self.levels is not None else None,
+            "max_output": self.max_output,
+            "tools": self.tools,
+            "source": self.source,
+        }
 
 
 @dataclass
@@ -42,16 +72,25 @@ class ToolSpec:
 class Usage:
     input_tokens: int = 0
     output_tokens: int = 0
+    reasoning_tokens: int = 0
 
 
 @dataclass
 class ChatResult:
-    """一次对话补全的完整结果。stop_reason: stop | tool_use | length | other"""
+    """一次对话补全的完整结果。stop_reason: stop | tool_use | length | other
+
+    reasoning 为 provider 明确返回的思考文本（无则为空）。
+    reasoning_blocks 保存 provider 原始思考块（如 Anthropic thinking+signature），
+    供下一轮按协议原样回传。
+    """
 
     text: str = ""
     tool_calls: list[ToolCall] = field(default_factory=list)
     stop_reason: str = "stop"
     usage: Usage = field(default_factory=Usage)
+    reasoning: str = ""
+    reasoning_blocks: list[dict] = field(default_factory=list)
+    blocks: list[dict] = field(default_factory=list)  # 原始有序内容块（协议回传用）
 
 
 class ProviderError(Exception):
@@ -75,6 +114,7 @@ class ContextOverflowError(ProviderError):
 
 
 OnText = Callable[[str], None]
+OnReasoning = Callable[[str], None]
 
 
 class Provider(Protocol):
@@ -85,4 +125,5 @@ class Provider(Protocol):
         messages: Sequence[Message],
         tools: Sequence[ToolSpec] | None = None,
         on_text: OnText | None = None,
+        on_reasoning: OnReasoning | None = None,
     ) -> ChatResult: ...

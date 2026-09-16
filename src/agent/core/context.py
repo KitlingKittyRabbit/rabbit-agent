@@ -1,12 +1,15 @@
-"""上下文管理：字符估算、截断、摘要序列化（纯函数，零依赖）。
+"""上下文估算、预算与截断（纯函数，零依赖）。
 
-B（默认）：摘要压缩——接近阈值时把旧历史压成 [前情摘要] 替换；
-A（兜底）：撞 ContextOverflowError 后 truncate_messages 砍半重试。
+预算数学在 model_catalog.context_budget（窗口未知 = 不压缩，仅保留溢出兜底）。
+精确 usage 优先；估算一律标「约」。
 """
 
 from __future__ import annotations
 
-from ..providers import Message
+from collections.abc import Sequence
+
+from ..providers import Message, ToolSpec
+from .model_catalog import context_budget, next_output_reserve  # noqa: F401  (re-export)
 
 COMPACT_PROMPT = """把以下对话历史压缩为一份要点摘要，供后续对话延续使用。
 保留：用户目标、已完成的动作及其结果、关键文件路径、未决事项。
@@ -16,13 +19,40 @@ SUMMARY_PREFIX = "[前情摘要]"
 
 
 def estimate_chars(messages: list[Message]) -> int:
-    """粗估上下文占用（字符数）：内容 + 工具调用参数。"""
+    """粗估消息字符数：内容 + 工具调用参数 + 工具结果（tool 消息即结果）。"""
     total = 0
     for m in messages:
         total += len(m.content)
         for tc in m.tool_calls or []:
             total += len(tc.name) + len(str(tc.arguments))
     return total
+
+
+def tool_schema_chars(tool_specs: Sequence[ToolSpec] | None) -> int:
+    """工具 schema 的字符量（名称+描述+参数 JSON）。"""
+    total = 0
+    for spec in tool_specs or []:
+        total += len(spec.name) + len(spec.description) + len(str(spec.parameters))
+    return total
+
+
+def estimate_request_chars(
+    messages: list[Message],
+    system: str = "",
+    tool_specs: Sequence[ToolSpec] | None = None,
+) -> int:
+    """完整请求的字符估算：system + 历史/工具结果 + 工具 schema。"""
+    return len(system) + estimate_chars(messages) + tool_schema_chars(tool_specs)
+
+
+def approximate_tokens(chars: int) -> int:
+    """字符数粗估 token（约 4 字符/token）；UI 展示必须标「约」。"""
+    return chars // 4
+
+
+def estimate_tokens(messages: list[Message], system: str = "", tool_specs=None) -> int:
+    """完整请求的 token 估算（混合中英文按 ~3.5 字符/token），仅供预算与「约」显示。"""
+    return int(estimate_request_chars(messages, system, tool_specs) / 3.5)
 
 
 def truncate_messages(messages: list[Message]) -> None:

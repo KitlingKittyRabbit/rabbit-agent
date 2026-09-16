@@ -286,15 +286,130 @@ async def test_transient_handshake_failure_recovers(monkeypatch) -> None:
     assert spawned == []  # 瞬态恢复，未拉起
 
 
-def test_server_url_reads_config_port(tmp_path: Path, monkeypatch) -> None:
+class _Response403:
+    status_code = 403
+
+
+async def test_spawn_uses_fresh_token_after_rewrite(tmp_path, monkeypatch) -> None:
+    """缺陷回归：自动拉起后 server 重写 ~/.agent_token，CLI 必须用新 token 才连得上。"""
+    import websockets.exceptions
+
+    token_file = tmp_path / "token"
+    token_file.write_text("old-token", encoding="utf-8")
+    monkeypatch.setattr(cli, "TOKEN_PATH", str(token_file))
+    monkeypatch.setattr(cli, "_RETRY_INTERVAL", 0)
+
+    class FakeProc:
+        def poll(self):
+            return None  # 仍在运行
+
+        def terminate(self):
+            pass
+
+    def fake_popen(*args, **kwargs):
+        token_file.write_text("new-token", encoding="utf-8")  # 模拟 server 启动重写 token
+        return FakeProc()
+
+    monkeypatch.setattr(cli.subprocess, "Popen", fake_popen)
+    urls: list[str] = []
+    ws = FakeWS()
+
+    def fake_connect(url, **kw):
+        urls.append(url)
+        if len(urls) == 1:
+            raise OSError("refused")  # 拉起前无人监听
+        if "token=new-token" not in url:
+            raise websockets.exceptions.InvalidStatus(_Response403())  # 旧 token 403
+        return FakeConnect(ws)
+
+    monkeypatch.setattr(cli.websockets, "connect", fake_connect)
+
+    result_ws, proc = await cli._connect_with_spawn("ws://127.0.0.1:8471/ws?token=old-token")
+    assert result_ws is ws
+    assert proc is not None
+    assert urls[-1] == "ws://127.0.0.1:8471/ws?token=new-token"
+
+
+async def test_stale_token_403_bounded(tmp_path, monkeypatch) -> None:
+    """旧 token 持续 403：必须有界重试并给出占用提示，不得无限重试/误拉 server。"""
+    import websockets.exceptions
+
+    token_file = tmp_path / "token"
+    token_file.write_text("stale-token", encoding="utf-8")
+    monkeypatch.setattr(cli, "TOKEN_PATH", str(token_file))
+    monkeypatch.setattr(cli, "_OCCUPIED_RETRIES", 2)
+    monkeypatch.setattr(cli, "_RETRY_INTERVAL", 0)
+
+    spawned = []
+    monkeypatch.setattr(cli.subprocess, "Popen", lambda *a, **kw: spawned.append(1) or None)
+    calls = {"n": 0}
+
+    def fake_connect(url, **kw):
+        calls["n"] += 1
+        raise websockets.exceptions.InvalidStatus(_Response403())
+
+    monkeypatch.setattr(cli.websockets, "connect", fake_connect)
+
+    with pytest.raises(SystemExit) as exc_info:
+        await cli._connect_with_spawn()
+    assert "持续被占用" in str(exc_info.value)
+    assert calls["n"] == 3  # 1 次初连 + _OCCUPIED_RETRIES，有界
+    assert spawned == []
+
+
+def _write_config(tmp_path: Path, monkeypatch, port: int = 8471) -> None:
     config = tmp_path / "config.toml"
     config.write_text(
-        '[agent]\nport = 8471\n\n[main]\nprotocol = "openai"\nmodel = "m"\n\n'
+        f'[agent]\nport = {port}\n\n[main]\nprotocol = "openai"\nmodel = "m"\n\n'
         '[executor]\nprotocol = "openai"\nmodel = "m"\n',
         encoding="utf-8",
     )
     monkeypatch.setenv("AGENT_CONFIG", str(config))
+
+
+def test_server_url_reads_config_port(tmp_path: Path, monkeypatch) -> None:
+    _write_config(tmp_path, monkeypatch)
+    monkeypatch.setattr(cli, "TOKEN_PATH", str(tmp_path / "no-token"))
     assert cli._server_url() == "ws://127.0.0.1:8471/ws"
+
+
+def test_server_url_appends_token_when_present(tmp_path: Path, monkeypatch) -> None:
+    """有 ~/.agent_token 时必须带上（否则被 Phase F 鉴权拒掉）。"""
+    _write_config(tmp_path, monkeypatch)
+    token_file = tmp_path / "token"
+    token_file.write_text("abc123\n", encoding="utf-8")
+    monkeypatch.setattr(cli, "TOKEN_PATH", str(token_file))
+    assert cli._server_url() == "ws://127.0.0.1:8471/ws?token=abc123"
+
+
+def test_read_token_missing_unreadable_empty(tmp_path: Path, monkeypatch) -> None:
+    """token 尚未生成、读失败（目录）、空内容、非法编码都视为无 token，不抛异常。"""
+    monkeypatch.setattr(cli, "TOKEN_PATH", str(tmp_path / "missing"))
+    assert cli._read_token() is None
+    directory = tmp_path / "dir"
+    directory.mkdir()
+    monkeypatch.setattr(cli, "TOKEN_PATH", str(directory))
+    assert cli._read_token() is None
+    empty = tmp_path / "empty"
+    empty.write_text("  \n", encoding="utf-8")
+    monkeypatch.setattr(cli, "TOKEN_PATH", str(empty))
+    assert cli._read_token() is None
+    garbage = tmp_path / "garbage"
+    garbage.write_bytes(b"\xff\xfe\x00garbage")
+    monkeypatch.setattr(cli, "TOKEN_PATH", str(garbage))
+    assert cli._read_token() is None
+
+
+def test_connect_url_rereads_token(tmp_path: Path, monkeypatch) -> None:
+    """每次调用都重读 token（自动拉起后 server 会换 token）。"""
+    token_file = tmp_path / "token"
+    token_file.write_text("one", encoding="utf-8")
+    monkeypatch.setattr(cli, "TOKEN_PATH", str(token_file))
+    assert cli._connect_url("ws://127.0.0.1:8471/ws") == "ws://127.0.0.1:8471/ws?token=one"
+    token_file.write_text("two", encoding="utf-8")
+    assert cli._connect_url("ws://127.0.0.1:8471/ws?token=one") == (
+        "ws://127.0.0.1:8471/ws?token=two"
+    )
 
 
 async def test_spawned_server_exits_immediately_reports(monkeypatch) -> None:
@@ -325,3 +440,13 @@ async def test_spawned_server_exits_immediately_reports(monkeypatch) -> None:
 def test_server_url_fallback_default(monkeypatch) -> None:
     monkeypatch.setenv("AGENT_CONFIG", "/nonexistent/config.toml")
     assert cli._server_url() == cli.DEFAULT_SERVER_URL
+
+
+async def test_wizard_custom_allows_empty_key(monkeypatch) -> None:
+    """自定义端点 key 可留空（本地/无鉴权），由后端判定；不再直接取消。"""
+    ws = FakeWS()
+    custom = str(len(PRESETS) + 1)
+    run_inputs(monkeypatch, ["2", custom, "openai", "http://127.0.0.1:9/v1", "m"], key="")
+    await cli._connect_wizard(ws, asyncio.get_running_loop())
+    assert ws.sent[0]["api_key"] == ""
+    assert ws.sent[0]["base_url"] == "http://127.0.0.1:9/v1"

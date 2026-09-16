@@ -1,4 +1,11 @@
-"""shell 工具：在工作目录执行命令，带超时、输出截断、取消杀进程、危险命令确认。"""
+"""shell 工具：项目目录内执行命令。
+
+执行边界（不是 regex 假装安全）：
+- 环境变量：最小 allowlist，不继承 server 的 provider 密钥等敏感变量
+- OS 沙箱：bwrap 可用时，项目 root 可写、系统其余只读、临时 /tmp
+  不可用时明确标记 unsandboxed（仅 env 隔离，不谎称沙箱）
+- 超时杀整个进程组；危险命令确认作为 UX 防护（≠ 沙箱）
+"""
 
 from __future__ import annotations
 
@@ -6,6 +13,8 @@ import asyncio
 import contextlib
 import os
 import re
+import shlex
+import shutil
 import signal
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -14,6 +23,20 @@ from ..providers import ToolSpec
 from .base import Tool
 
 _MAX_OUTPUT = 8192
+
+# 敏感环境变量隔离：executor shell 只允许这些（provider key 等一律不继承）
+_ENV_ALLOWLIST = (
+    "PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE",
+    "TZ", "USER", "LOGNAME", "SYSTEMROOT", "WINDIR",
+)
+
+_BWRAP = shutil.which("bwrap")
+
+# 敏感 home/config：沙箱内遮蔽（文件用 /dev/null 覆盖，目录用 tmpfs 覆盖）
+_MASK_PATHS = (
+    ".ssh", ".gnupg", ".aws", ".kube", ".docker", ".config",
+    ".netrc", ".agent_token", ".providers.toml", ".projects.toml",
+)
 
 _DANGEROUS_PATTERNS = [
     r"\brm\s+[^|;&]*-[a-zA-Z]*[rf]",
@@ -25,6 +48,44 @@ _DANGEROUS_PATTERNS = [
     r"\breboot\b",
     r"\bchmod\s+-R\s+777",
 ]
+
+
+def sandbox_mode() -> str:
+    """当前 shell 沙箱状态：bwrap | unsandboxed。"""
+    return "bwrap" if _BWRAP else "unsandboxed"
+
+
+def _sandbox_env() -> dict:
+    return {k: v for k, v in os.environ.items() if k in _ENV_ALLOWLIST}
+
+
+def _mask_args() -> str:
+    """敏感路径的 bwrap 遮蔽参数（仅对存在的路径生效）。"""
+    home = Path.home()
+    parts: list[str] = []
+    for name in _MASK_PATHS:
+        path = home / name
+        if path.is_dir():
+            parts.append(f"--tmpfs {shlex.quote(str(path))}")
+        elif path.exists():
+            parts.append(f"--ro-bind /dev/null {shlex.quote(str(path))}")
+    return " ".join(parts)
+
+
+def _wrap_command(command: str, root: Path) -> str:
+    """bwrap 包裹：root 可写，其余只读，临时 /tmp，敏感 home 路径遮蔽。"""
+    if _BWRAP is None:
+        return command
+    quoted_root = shlex.quote(str(root))
+    # 不用 --new-session：沙箱内进程须留在我们的进程组，killpg 才能整组杀
+    # mask 放在 root bind 之后：遮蔽必须最后生效（root bind 可能意外覆盖敏感路径）
+    return (
+        f"{_BWRAP} --die-with-parent"
+        f" --ro-bind / / --dev-bind /dev /dev --proc /proc --tmpfs /tmp"
+        f" --bind {quoted_root} {quoted_root} {_mask_args()}"
+        f" --chdir {quoted_root}"
+        f" sh -c {shlex.quote(command)}"
+    )
 
 
 def is_dangerous(command: str) -> bool:
@@ -45,8 +106,9 @@ def make_shell_tool(root: Path, confirm: Callable[[str], Awaitable[bool]] | None
                 return f"已被用户拒绝执行（危险命令）: {command}"
         timeout = float(args.get("timeout", 60))
         proc = await asyncio.create_subprocess_shell(
-            command,
+            _wrap_command(command, root),
             cwd=root,
+            env=_sandbox_env(),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             start_new_session=True,  # 独立进程组，killpg 的前提

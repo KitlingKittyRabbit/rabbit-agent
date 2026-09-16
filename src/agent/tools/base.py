@@ -23,13 +23,14 @@ class Tool:
 class ToolRegistry:
     """按名索引的工具表。主/sub agent 的差异就是挂载不同的注册表。
 
-    on_call 非空时，每次成功调用后回调 (name, args, result)——审计日志的挂点。
+    on_call 非空时按阶段回调 (name, args, phase, payload)：
+    started / finished(成功) / error(异常)——审计日志的挂点。
     """
 
     def __init__(
         self,
         tools: Iterable[Tool] = (),
-        on_call: Callable[[str, dict, str], None] | None = None,
+        on_call: Callable[[str, dict, str, str | None], None] | None = None,
     ) -> None:
         self._tools = {t.spec.name: t for t in tools}
         self._on_call = on_call
@@ -46,9 +47,16 @@ class ToolRegistry:
     async def call(self, name: str, arguments: dict) -> str:
         if name not in self._tools:
             raise ToolError(f"未知工具: {name}")
-        result = await self._tools[name].handler(arguments)
         if self._on_call is not None:
-            self._on_call(name, arguments, result)
+            self._on_call(name, arguments, "started", None)
+        try:
+            result = await self._tools[name].handler(arguments)
+        except Exception as e:
+            if self._on_call is not None:
+                self._on_call(name, arguments, "error", str(e))
+            raise
+        if self._on_call is not None:
+            self._on_call(name, arguments, "finished", result)
         return result
 
     async def call_safe(self, name: str, arguments: dict) -> str:
