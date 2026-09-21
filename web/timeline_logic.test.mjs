@@ -4,12 +4,14 @@ import assert from "node:assert/strict";
 import {
   breadcrumb,
   composerLayout,
+  executorMessageView,
   connectRequestForRow,
   connectRowPlan,
   contextLabel,
   capabilityEditorState,
   capabilityFormState,
   capabilityOverrideFromForm,
+  effortChipVisible,
   effortLabel,
   effortState,
   countActions,
@@ -33,11 +35,16 @@ import {
   providerListState,
   roleModelOptions,
   ringLabel,
+  ringVisible,
+  roleEffortVisible,
   reasoningTarget,
   roleStatusText,
   routeActionEvent,
   sessionLabel,
   shouldDropShell,
+  extractMath,
+  liveBufferStale,
+  shouldStickToBottom,
   subagentTaskCount,
   taskCardAction,
   taskCardLines,
@@ -712,4 +719,129 @@ test("连接消息空值归一化：protocol 缺省为空串、baseUrl 缺省为
   assert.deepEqual(connectRequestForRow({kind: "custom", protocol: "openai"}, ""), {
     type: "connect_provider", protocol: "openai", base_url: null, api_key: "",
   });
+});
+
+
+test("控件可见性：能力未知不显示思考控件，窗口未知不显示上下文环", () => {
+  assert.equal(effortChipVisible(null), false);
+  assert.equal(effortChipVisible({reasoning_mode: "unknown", efforts: null}), false);
+  assert.equal(effortChipVisible({reasoning_mode: "fixed", efforts: []}), false);
+  assert.equal(effortChipVisible({reasoning_mode: "none", efforts: []}), false);
+  assert.equal(effortChipVisible({reasoning_mode: "adjustable", efforts: null}), false);
+  assert.equal(effortChipVisible({reasoning_mode: "adjustable", efforts: ["off", "low"]}), true);
+
+  assert.equal(ringVisible(null), false);
+  assert.equal(ringVisible(undefined), false);
+  assert.equal(ringVisible(0), false);
+  assert.equal(ringVisible(128000), true);
+  assert.equal(ringVisible(77777), true);
+});
+
+
+test("未配置角色不得显示强度控件（即使缓存了可调能力）", () => {
+  const adjustable = {reasoning_mode: "adjustable", efforts: ["off", "low"]};
+  assert.equal(roleEffortVisible({...adjustable, configured: false}), false);
+  assert.equal(roleEffortVisible({...adjustable, configured: true}), true);
+  assert.equal(roleEffortVisible({configured: true, reasoning_mode: "unknown", efforts: null}), false);
+  assert.equal(roleEffortVisible(null), false);
+});
+
+
+test("effortLabel 支持 max；能力来源支持公共目录", () => {
+  assert.equal(effortLabel("max"), "最高");
+  const form = capabilityFormState({ window_source: "catalog" });
+  assert.equal(form.source, "公共目录");
+});
+
+
+test("执行者消息视图：role/text/思考/工具调用/工具结果", () => {
+  const v = executorMessageView({
+    role: "assistant", content: "干活", reasoning: "想想",
+    tool_calls: [{name: "read_file", arguments: {path: "a.txt"}}],
+  });
+  assert.deepEqual(v, {role: "assistant", text: "干活", reasoning: "想想",
+                       calls: [{name: "read_file", arguments: {path: "a.txt"}}],
+                       isToolResult: false});
+  const tr = executorMessageView({role: "tool", content: "结果"});
+  assert.equal(tr.isToolResult, true);
+  assert.deepEqual(tr.calls, []);
+  assert.equal(executorMessageView(null).text, "");
+});
+
+test("执行者时间线：在底部才跟随，上翻后不被拽回", () => {
+  assert.equal(shouldStickToBottom(1000, 400, 600), true);    // 贴底
+  assert.equal(shouldStickToBottom(1000, 350, 600), false);   // 上翻 50px
+  assert.equal(shouldStickToBottom(1000, 300, 600), false);
+  assert.equal(shouldStickToBottom(600, 0, 600), true);       // 不可滚动
+  assert.equal(shouldStickToBottom(1000, 361, 600), true);    // 距底 <40 视为贴底
+});
+
+test("实时缓冲退役：按轮次身份判定（同文案/短前缀不误清）", () => {
+  // 第一轮流式中：缓冲 round=0，inflight 里还没有 assistant → 保留
+  assert.equal(liveBufferStale(0, 0), false);
+  // 第一轮完成：inflight 出现 1 条 assistant → 退役
+  assert.equal(liveBufferStale(0, 1), true);
+  // 第二轮流式中：round=1，inflight 仍是 1 条（上一轮） → 保留（即使文案完全相同）
+  assert.equal(liveBufferStale(1, 1), false);
+  // 第二轮完成：inflight 2 条 → 退役
+  assert.equal(liveBufferStale(1, 2), true);
+  // 缺省/异常输入安全
+  assert.equal(liveBufferStale(undefined, 0), false);
+  assert.equal(liveBufferStale(undefined, 2), true);
+});
+
+test("公式提取：四种分隔符 + 代码段保护 + 单 $ 防误伤", () => {
+  const r = extractMath("行内 \\(a^2\\) 展示 \\[\\int_0^1 x\\,dx\\] 美元 $$E=mc^2$$ 和 $b+c$");
+  assert.equal(r.items.length, 4, JSON.stringify(r));
+  assert.deepEqual(r.items[0], {tex: "a^2", display: false});
+  assert.deepEqual(r.items[1], {tex: "\\int_0^1 x\\,dx", display: true});
+  assert.deepEqual(r.items[2], {tex: "E=mc^2", display: true});
+  assert.deepEqual(r.items[3], {tex: "b+c", display: false});
+  assert.equal(r.text.includes("\\("), false);       // 原文分隔符已被占位
+  assert.equal(r.text.includes("@@KATEX0@@"), true);
+
+  const code = extractMath("`\\(not math\\)` 与 ```\n$$x$$\n``` 之后 \\(yes\\)");
+  assert.equal(code.items.length, 1);
+  assert.equal(code.items[0].tex, "yes");
+  assert.equal(code.text.includes("`\\(not math\\)`"), true);   // 行内代码原样
+
+  const price = extractMath("价格是 $5 一个");
+  assert.equal(price.items.length, 0);                // 单 $ 后紧跟空格/数字：不误伤
+
+  const escaped = extractMath("价格 \\$5 到 \\$10 之间有 \\(x\\)");
+  assert.equal(escaped.items.length, 1);              // 转义美元不算公式
+  assert.equal(escaped.items[0].tex, "x");
+
+  const pair = extractMath("从 $5 到 $10 的区间");
+  assert.equal(pair.items.length, 0);                 // 成对价格不误伤（$ 前有空格）
+
+  const tilde = extractMath("~~~\n$$x$$\n~~~ 之后 \\(y\\)");
+  assert.equal(tilde.items.length, 1);
+  assert.equal(tilde.items[0].tex, "y");              // ~~~ 围栏内不处理
+
+  const indented = extractMath("    $$x$$\n\\(y\\)");
+  assert.equal(indented.items.length, 1);
+  assert.equal(indented.items[0].tex, "y");           // 段首缩进代码不处理
+
+  const afterBlank = extractMath("段落\n\n    $$x$$\n\\(y\\)");
+  assert.equal(afterBlank.items.length, 1);
+  assert.equal(afterBlank.items[0].tex, "y");         // 空行后的缩进块是代码（x 不提取）
+
+  const listCont = extractMath("- 项目\n    $x$");
+  assert.equal(listCont.items.length, 1);             // 列表缩进续行是正文
+  assert.equal(listCont.items[0].tex, "x");
+
+  const paraCont = extractMath("段落文字\n    $y$ 续行");
+  assert.equal(paraCont.items.length, 1);             // 段落缩进续行是正文
+  assert.equal(paraCont.items[0].tex, "y");
+
+  const multi = extractMath("$$\nE = mc^2\n$$ 与 \\[\n\\int_0^1 x\\,dx\n\\] 与 \\(a +\nb\\)");
+  assert.equal(multi.items.length, 3);                // 跨行公式不受缩进处理影响
+  assert.deepEqual(multi.items[0], {tex: "E = mc^2", display: true});
+  assert.equal(multi.items[1].display, true);
+  assert.equal(multi.items[2].display, false);
+
+  const multiAfterCode = extractMath("    $$x$$\n$$\nE=mc^2\n$$");
+  assert.equal(multiAfterCode.items.length, 1);       // 代码块跳过、跨行公式仍提取
+  assert.equal(multiAfterCode.items[0].tex, "E=mc^2");
 });

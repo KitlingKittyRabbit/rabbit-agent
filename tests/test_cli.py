@@ -78,7 +78,7 @@ async def test_wizard_preset_path(monkeypatch) -> None:
             "role": "main",
             "protocol": "openai",
             "base_url": "https://api.deepseek.com/v1",
-            "model": "deepseek-chat",
+            "model": "deepseek-flash",
             "api_key": "sk-x",
         }
     ]

@@ -6,8 +6,10 @@ from pathlib import Path
 
 from agent.core.keystore import load_keys, save_key
 from agent.core.orchestrator import Orchestrator
+from agent.core.presets import PRESETS
 from agent.core.provider_store import derive_provider_id, load_registry, save_registry
 from agent.providers import AuthError, ChatResult, FakeProvider
+from agent.providers.catalog import save_catalog
 
 
 def make_orchestrator(tmp_path: Path, factory, store: bool = True) -> Orchestrator:
@@ -1871,7 +1873,7 @@ def _entry(model_id: str, levels=None) -> dict:
 async def test_provider_connect_binds_unconfigured_roles_with_default(tmp_path: Path) -> None:
     """role=""：一次连接把未配置的 main/executor 都绑到默认模型，凭据只保存一份。"""
     fake = FakeProvider([ChatResult(text="pong")])
-    fake.models = [_entry("other-model"), _entry("deepseek-chat")]
+    fake.models = [_entry("other-model"), _entry("deepseek-flash")]
 
     def factory(**kw):
         fake._api_key = kw["api_key"]
@@ -1884,8 +1886,8 @@ async def test_provider_connect_binds_unconfigured_roles_with_default(tmp_path: 
     assert result["ok"] is True, result
     assert "main" in result["message"] and "executor" in result["message"]
     status = orch.provider_status()
-    assert status["roles"]["main"]["model"] == "deepseek-chat"   # 预设默认，且在列表内
-    assert status["roles"]["executor"]["model"] == "deepseek-chat"
+    assert status["roles"]["main"]["model"] == "deepseek-flash"   # 预设默认，且在列表内
+    assert status["roles"]["executor"]["model"] == "deepseek-flash"
     pid = status["roles"]["main"]["provider_id"]
     assert pid == status["roles"]["executor"]["provider_id"]
     assert status["presets"]["deepseek"]["configured"] is True
@@ -1922,7 +1924,7 @@ async def test_provider_connect_keeps_existing_bindings(tmp_path: Path) -> None:
 async def test_provider_connect_falls_back_to_first_listed(tmp_path: Path) -> None:
     """预设默认模型不在真实列表中 → 选列表第一个。"""
     fake = FakeProvider([ChatResult(text="pong")])
-    fake.models = [_entry("deepseek-v4-pro"), _entry("deepseek-flash")]
+    fake.models = [_entry("deepseek-v4-pro"), _entry("deepseek-v3.2")]
     orch = make_orchestrator(tmp_path, lambda **kw: fake)
     result = await orch.connect_provider(
         "", protocol="openai", base_url="https://api.deepseek.com/v1",
@@ -2066,3 +2068,520 @@ async def test_malformed_base_url_does_not_crash(tmp_path: Path) -> None:
     assert result["ok"] is False
     assert "缺少 API key" in result["message"]
     assert recorder.calls == []
+
+
+# ---------- models.dev 公共目录补齐能力（离线夹具 + 注入 fetcher） ----------
+
+_CATALOG_FIXTURE = {
+    "deepseek": {"models": {
+        "ds-a": {"reasoning": True, "tool_call": True,
+                 "reasoning_options": [{"type": "toggle"},
+                                       {"type": "effort", "values": ["low", "high", "max"]}],
+                 "interleaved": {"field": "reasoning_content"},
+                 "limit": {"context": 1_000_000, "output": 384_000}},
+    }},
+}
+
+
+def _catalog_orch(tmp_path, models, *, catalog=(), fresh_cache=False):
+    """构建带夹具 catalog 的 Orchestrator。"""
+    providers = _CATALOG_FIXTURE if "deepseek" in catalog else {}
+
+    async def fetcher():
+        return providers
+
+    orch = make_orchestrator(tmp_path, lambda **kw: None, store=False)
+    orch.providers._catalog_fetcher = fetcher
+    return orch
+
+
+async def test_catalog_fills_unknown_capability_after_connect(tmp_path: Path) -> None:
+    """连接后：provider 未返回能力时由公共目录补齐（窗口/档位/最大输出/tools）。"""
+    fake = FakeProvider([ChatResult(text="pong")])
+    fake.models = [{"id": "ds-a", "display_name": "A", "capability": {}}]  # 无能力字段
+
+    async def fetcher():
+        return _CATALOG_FIXTURE
+
+    orch = make_orchestrator(tmp_path, lambda **kw: fake)
+    orch.providers._catalog_fetcher = fetcher
+    result = await orch.connect_provider(
+        "", protocol="openai", base_url="https://api.deepseek.com/v1",
+        model="ds-a", api_key="sk-shared", preset="deepseek")
+    assert result["ok"] is True, result
+    status = orch.provider_status()["roles"]["main"]
+    assert status["window"] == 1_000_000 and status["window_source"] == "catalog"
+    assert status["reasoning_mode"] == "adjustable"
+    assert status["efforts"] == ["off", "low", "high", "max"]
+    assert status["tools"] is True
+    # 目录里的模型行也带能力（展示用）
+    catalog = await orch.list_models()
+    models = catalog["providers"][0]["models"]
+    assert models[0]["capability"]["window"] == 1_000_000
+    # 注册表仍只存原始 provider 元数据（不把目录数据写进去）
+    saved = load_registry(tmp_path / ".providers.toml")["providers"]
+    pid = derive_provider_id("openai", "https://api.deepseek.com/v1")
+    raw_cap = saved[pid]["models"][0]["capability"]
+    assert raw_cap == {"source": "provider"} or all(
+        v is None for k, v in raw_cap.items() if k != "source")
+
+    assert orch.set_reasoning_effort("main", "max")["ok"] is True
+    assert orch.main_provider._reasoning_effort == "max"
+
+
+async def test_provider_metadata_beats_catalog_and_user_beats_all(tmp_path: Path) -> None:
+    """优先级：provider 元数据 > 公共目录；用户覆盖 > 一切。"""
+    fake = FakeProvider([ChatResult(text="pong")])
+    fake.models = [{"id": "ds-a", "capability": {
+        "window": 777, "reasoning_returned": None, "reasoning_mode": "unknown",
+        "levels": None, "max_output": None, "tools": None, "source": "provider"}}]
+
+    async def fetcher():
+        return _CATALOG_FIXTURE
+
+    orch = make_orchestrator(tmp_path, lambda **kw: fake)
+    orch.providers._catalog_fetcher = fetcher
+    await orch.connect_provider("", protocol="openai", base_url="https://api.deepseek.com/v1",
+                                model="ds-a", api_key="sk-k", preset="deepseek")
+    status = orch.provider_status()["roles"]["main"]
+    assert status["window"] == 777 and status["window_source"] == "provider"  # provider 胜出
+    assert status["efforts"] == ["off", "low", "high", "max"]               # 档位补自目录
+
+    pid = derive_provider_id("openai", "https://api.deepseek.com/v1")
+    orch.set_model_capability(pid, "ds-a", {"window": 42_000})
+    status = orch.provider_status()["roles"]["main"]
+    assert status["window"] == 42_000 and status["window_source"] == "user"
+
+
+async def test_catalog_fetch_failure_silently_unknown(tmp_path: Path) -> None:
+    async def fetcher():
+        raise RuntimeError("网络挂了")
+
+    fake = FakeProvider([ChatResult(text="pong")])
+    fake.models = [{"id": "ds-a", "capability": {}}]
+    orch = make_orchestrator(tmp_path, lambda **kw: fake)
+    orch.providers._catalog_fetcher = fetcher
+    result = await orch.connect_provider(
+        "", protocol="openai", base_url="https://api.deepseek.com/v1",
+        model="ds-a", api_key="sk-k", preset="deepseek")
+    assert result["ok"] is True  # 目录拉取失败不影响连接
+    status = orch.provider_status()["roles"]["main"]
+    assert status["window"] is None and status["reasoning_mode"] == "unknown"
+
+
+async def test_catalog_cache_fresh_skips_fetch(tmp_path: Path) -> None:
+    """缓存新鲜时连接不重拉（fetcher 不应被调用）。"""
+    cache = tmp_path / "models-dev.json"  # keys_path 同目录（缓存跟随 keys_path）
+    calls = 0
+
+    async def fetcher():
+        nonlocal calls
+        calls += 1
+        return _CATALOG_FIXTURE
+
+    fake = FakeProvider([ChatResult(text="pong")])
+    fake.models = [{"id": "ds-a", "capability": {}}]
+    orch = make_orchestrator(tmp_path, lambda **kw: fake)
+    orch.providers._catalog_fetcher = fetcher
+    # 先写一份新鲜缓存（conftest 已把 KEYS_DIR 隔离到 tmp）
+    save_catalog(cache, _CATALOG_FIXTURE)
+    await orch.connect_provider("", protocol="openai", base_url="https://api.deepseek.com/v1",
+                                model="ds-a", api_key="sk-k", preset="deepseek")
+    assert calls == 0
+    assert orch.provider_status()["roles"]["main"]["window"] == 1_000_000
+
+
+async def test_custom_endpoint_without_catalog_mapping_stays_unknown(tmp_path: Path) -> None:
+    """自定义端点不匹配任何预设目录 → 保持未知（不猜测）。"""
+    async def fetcher():
+        return _CATALOG_FIXTURE
+
+    fake = FakeProvider([ChatResult(text="pong")])
+    fake.models = [{"id": "ds-a", "capability": {}}]
+    orch = make_orchestrator(tmp_path, lambda **kw: fake)
+    orch.providers._catalog_fetcher = fetcher
+    await orch.connect_provider("", protocol="openai", base_url="http://127.0.0.1:9/v1",
+                                model="ds-a", api_key="")
+    status = orch.provider_status()["roles"]["main"]
+    assert status["window"] is None and status["reasoning_mode"] == "unknown"
+
+
+async def test_catalog_disk_cache_applies_at_startup_without_fetch(tmp_path: Path) -> None:
+    """启动只读磁盘缓存（零外呼）：注册表绑定的无能力模型由公共目录补齐。"""
+    pid = derive_provider_id("openai", "http://127.0.0.1:9/v1")
+    _seed_registry(tmp_path,
+                   {pid: {"name": "x", "protocol": "openai",
+                          "base_url": "http://127.0.0.1:9/v1", "catalog": "deepseek",
+                          "model_overrides": {},
+                          "models": [_model("ds-a")], "models_fetched_at": 1.0}},
+                   {"main": {"provider_id": pid, "model": "ds-a", "reasoning_effort": "off"}})
+    save_key(pid, "sk-k", tmp_path / "keys.json")
+
+    save_catalog(tmp_path / "models-dev.json", _CATALOG_FIXTURE)
+
+    async def boom():
+        raise AssertionError("启动不得拉取公共目录")
+
+    orch = Orchestrator(main_provider=None, executor_provider=None, root=tmp_path,
+                        store_path=tmp_path / ".providers.toml",
+                        keys_path=tmp_path / "keys.json", catalog_fetcher=boom)
+    status = orch.provider_status()["roles"]["main"]
+    assert status["window"] == 1_000_000 and status["window_source"] == "catalog"
+    assert status["efforts"] == ["off", "low", "high", "max"]
+
+
+async def test_no_catalog_fetch_when_no_provider_mapped(tmp_path: Path) -> None:
+    """没有任何映射到公共目录的 provider 时：连接/刷新不得拉取（零外呼）。"""
+    calls = 0
+
+    async def fetcher():
+        nonlocal calls
+        calls += 1
+        return _CATALOG_FIXTURE
+
+    fake = FakeProvider([ChatResult(text="pong")])
+    fake.models = [{"id": "m", "capability": {}}]
+    orch = make_orchestrator(tmp_path, lambda **kw: fake)
+    orch.providers._catalog_fetcher = fetcher
+    await orch.connect_provider("", protocol="openai", base_url="http://127.0.0.1:9/v1",
+                                model="m", api_key="")
+    await orch.list_models(refresh=True)
+    assert calls == 0
+
+
+async def test_anthropic_catalog_never_produces_unsupported_effort(tmp_path: Path) -> None:
+    """漏洞 A：kimi（anthropic 协议）经目录获得档位后，强度请求必须落到已知预算档。"""
+    fake = FakeProvider([ChatResult(text="pong")])
+    fake.models = [{"id": "kimi-for-coding", "capability": {}}]
+    fixture = {"kimi-code-plan-cn": {"models": {"kimi-for-coding": {
+        "reasoning": True, "tool_call": True,
+        "reasoning_options": [{"type": "toggle"},
+                              {"type": "effort", "values": ["low", "high", "max"]}],
+        "limit": {"context": 262_144, "output": 262_144}}}}}
+
+    async def fetcher():
+        return fixture
+
+    orch = make_orchestrator(tmp_path, lambda **kw: fake)
+    orch.providers._catalog_fetcher = fetcher
+    result = await orch.connect_provider(
+        "", protocol="anthropic", base_url="https://api.kimi.com/coding/",
+        model="", api_key="sk-k", preset="kimi-coding")
+    assert result["ok"] is True, result
+    status = orch.provider_status()["roles"]["main"]
+    assert status["efforts"] == ["off", "low", "medium", "high"]  # 无 max
+    assert orch.set_reasoning_effort("main", "high")["ok"] is True
+
+
+async def test_custom_official_host_matches_preset_catalog(tmp_path: Path) -> None:
+    """自定义填官方主机（https://api.anthropic.com）也命中预设目录（兜底匹配主机）。"""
+    fake = FakeProvider([ChatResult(text="pong")])
+    fake.models = [{"id": "claude-x", "capability": {}}]
+    fixture = {"anthropic": {"models": {"claude-x": {
+        "reasoning": True, "tool_call": True,
+        "reasoning_options": [{"type": "budget_tokens"}],
+        "limit": {"context": 400_000, "output": 64_000}}}}}
+
+    async def fetcher():
+        return fixture
+
+    orch = make_orchestrator(tmp_path, lambda **kw: fake)
+    orch.providers._catalog_fetcher = fetcher
+    result = await orch.connect_provider(
+        "", protocol="anthropic", base_url="https://api.anthropic.com",
+        model="claude-x", api_key="sk-k")
+    assert result["ok"] is True, result
+    status = orch.provider_status()["roles"]["main"]
+    assert status["window"] == 400_000 and status["window_source"] == "catalog"
+
+
+def test_catalog_path_follows_keys_path(tmp_path: Path) -> None:
+    orch = Orchestrator(main_provider=None, executor_provider=None, root=tmp_path,
+                        store_path=tmp_path / ".providers.toml",
+                        keys_path=tmp_path / "mykeys.json")
+    assert orch._catalog_path() == tmp_path / "models-dev.json"
+
+
+def _anthropic_fake(reasoning_effort="off"):
+    fake = FakeProvider([ChatResult(text="pong")])
+    fake.reasoning_reserve = lambda effort: {"off": 0, "low": 2048, "medium": 8192,
+                                             "high": 16384}.get(effort, 0)
+    fake._reasoning_effort = reasoning_effort
+    return fake
+
+
+async def test_anthropic_unknown_declared_effort_rejected_at_use(tmp_path: Path) -> None:
+    """用户声明协议不认识的档位（如 anthropic 的 max）：设置强度必须明确报错，不得静默。"""
+    fake = _anthropic_fake()
+    orch = make_orchestrator(tmp_path, lambda **kw: fake)
+    result = await orch.connect_provider(
+        "", protocol="anthropic", base_url="http://127.0.0.1:9",
+        model="claude-x", api_key="")
+    assert result["ok"] is True, result
+    pid = derive_provider_id("anthropic", "http://127.0.0.1:9")
+    orch.set_model_capability(pid, "claude-x",
+                              {"reasoning_mode": "adjustable", "levels": ["off", "max"]})
+    result = orch.set_reasoning_effort("main", "max")
+    assert result["ok"] is False and "不识别" in result["message"]
+    assert orch.main_provider._reasoning_effort == "off"
+    assert orch.set_reasoning_effort("main", "off")["ok"] is True
+
+
+async def test_connect_with_unmappable_effort_fails_loudly(tmp_path: Path) -> None:
+    """连接时选了协议不认识的档位：明确失败，不得静默省略 thinking。"""
+    fake = _anthropic_fake()
+    fake.models = [{"id": "claude-x", "capability": {}}]
+    orch = make_orchestrator(tmp_path, lambda **kw: fake)
+    await orch.connect_provider("", protocol="anthropic", base_url="http://127.0.0.1:9",
+                                model="claude-x", api_key="")
+    pid = derive_provider_id("anthropic", "http://127.0.0.1:9")
+    orch.set_model_capability(pid, "claude-x",
+                              {"reasoning_mode": "adjustable", "levels": ["off", "max"]})
+    result = await orch.connect_provider(
+        "", protocol="anthropic", base_url="http://127.0.0.1:9",
+        model="claude-x", api_key="", reasoning_effort="max")
+    assert result["ok"] is False and "不识别" in result["message"]
+
+
+async def test_catalog_matches_by_api_host_when_provider_renamed(tmp_path: Path) -> None:
+    """改名免疫：预设名与显式名都对不上时，按目录条目的 api 主机一致来匹配。"""
+    fixture = {"deepseek-renamed-2026": {
+        "api": "https://api.deepseek.com/v1",
+        "models": {"ds-a": {
+            "reasoning": True, "tool_call": True,
+            "reasoning_options": [{"type": "toggle"},
+                                  {"type": "effort", "values": ["low", "high"]}],
+            "limit": {"context": 555_000, "output": 32_000}}},
+    }}
+
+    async def fetcher():
+        return fixture
+
+    fake = FakeProvider([ChatResult(text="pong")])
+    fake.models = [{"id": "ds-a", "capability": {}}]
+    orch = make_orchestrator(tmp_path, lambda **kw: fake)
+    orch.providers._catalog_fetcher = fetcher
+    result = await orch.connect_provider(
+        "", protocol="openai", base_url="https://api.deepseek.com/v1",
+        model="ds-a", api_key="sk-k", preset="deepseek")
+    assert result["ok"] is True, result
+    status = orch.provider_status()["roles"]["main"]
+    assert status["window"] == 555_000 and status["window_source"] == "catalog"
+    assert status["efforts"] == ["off", "low", "high"]
+
+
+async def test_catalog_alias_fallback_when_primary_name_missing(tmp_path: Path) -> None:
+    """候选名兜底：主名对不上时用旧名别名命中（条目无 api 字段，排除地址匹配）。"""
+    fixture = {"kimi-for-coding": {"models": {
+        "kimi-for-coding": {
+            "reasoning": True, "tool_call": True,
+            "reasoning_options": [{"type": "toggle"},
+                                  {"type": "effort", "values": ["low", "high"]}],
+            "limit": {"context": 262_144, "output": 32_768}}},
+    }}
+
+    async def fetcher():
+        return fixture
+
+    fake = FakeProvider([ChatResult(text="pong")])
+    fake.models = [{"id": "kimi-for-coding", "capability": {}}]
+    orch = make_orchestrator(tmp_path, lambda **kw: fake)
+    orch.providers._catalog_fetcher = fetcher
+    result = await orch.connect_provider(
+        "", protocol="anthropic", base_url="https://api.kimi.com/coding/",
+        model="", api_key="sk-k", preset="kimi-coding")
+    assert result["ok"] is True, result
+    status = orch.provider_status()["roles"]["main"]
+    assert status["window"] == 262_144 and status["window_source"] == "catalog"
+    assert status["efforts"] == ["off", "low", "medium", "high"]
+
+
+async def test_catalog_endpoint_match_uses_path_not_just_host(tmp_path: Path) -> None:
+    """回归（审核 V1）：同一主机不同路径按端点指纹匹配，不得只按主机串台。"""
+    base = "https://api.example.com/v1"
+    fixture = {
+        "wrong-path": {"api": "https://api.example.com/v2",
+                       "models": {"m": {"limit": {"context": 111}, "reasoning": False}}},
+        "right-path": {"api": base,
+                       "models": {"m": {"limit": {"context": 222}, "reasoning": False}}},
+    }
+
+    async def fetcher():
+        return fixture
+
+    fake = FakeProvider([ChatResult(text="pong")])
+    fake.models = [{"id": "m", "capability": {}}]
+    orch = make_orchestrator(tmp_path, lambda **kw: fake)
+    orch.providers._catalog_data = {"providers": fixture}  # 模拟目录已加载
+    orch.providers._catalog_fetcher = fetcher
+    result = await orch.connect_provider("", protocol="openai", base_url=base,
+                                         model="m", api_key="sk-k")
+    assert result["ok"] is True, result
+    assert orch.provider_status()["roles"]["main"]["window"] == 222
+
+
+async def test_catalog_capability_skips_candidate_without_model(tmp_path: Path) -> None:
+    """回归（审核 V2）：同端点多候选时按"谁真含该模型"回溯，首个命中不得遮蔽。"""
+    base = "https://api.example.com/v1"
+    fixture = {
+        "alpha": {"api": base, "models": {"other-model": {"limit": {"context": 1}}}},
+        "beta": {"api": base, "models": {"m": {"limit": {"context": 333},
+                                               "reasoning": False}}},
+    }
+
+    async def fetcher():
+        return fixture
+
+    fake = FakeProvider([ChatResult(text="pong")])
+    fake.models = [{"id": "m", "capability": {}}]
+    orch = make_orchestrator(tmp_path, lambda **kw: fake)
+    orch.providers._catalog_data = {"providers": fixture}  # 模拟目录已加载
+    orch.providers._catalog_fetcher = fetcher
+    result = await orch.connect_provider("", protocol="openai", base_url=base,
+                                         model="m", api_key="sk-k")
+    assert result["ok"] is True, result
+    assert orch.provider_status()["roles"]["main"]["window"] == 333
+
+
+async def test_catalog_local_hosts_never_matched_by_address(tmp_path: Path) -> None:
+    """回归（审核 V1）：本地/私网端点不参与目录地址匹配（不同端口不得串台）。"""
+    base = "http://127.0.0.1:11434/v1"
+    fixture = {
+        "wrong-local": {"api": "http://127.0.0.1:1337/v1",
+                        "models": {"qwen3": {"limit": {"context": 111}}}},
+        "right-local": {"api": base,
+                        "models": {"qwen3": {"limit": {"context": 222}}}},
+    }
+
+    async def fetcher():
+        return fixture
+
+    fake = FakeProvider([ChatResult(text="pong")])
+    fake.models = [{"id": "qwen3", "capability": {}}]
+    orch = make_orchestrator(tmp_path, lambda **kw: fake)
+    orch.providers._catalog_data = {"providers": fixture}
+    orch.providers._catalog_fetcher = fetcher
+    result = await orch.connect_provider("", protocol="openai", base_url=base,
+                                         model="qwen3", api_key="")
+    assert result["ok"] is True, result
+    status = orch.provider_status()["roles"]["main"]
+    assert status["window"] is None and status["window_source"] == "unknown"
+
+
+async def test_catalog_path_prefix_must_be_version_segment(tmp_path: Path) -> None:
+    """回归（审核残留）：/v1 与 /v1beta 不得视为同一端点。"""
+    fixture = {"beta-api": {"api": "https://api.example.com/v1beta",
+                            "models": {"m": {"limit": {"context": 111}}}},
+               "v1-api": {"api": "https://api.example.com/v1",
+                          "models": {"m": {"limit": {"context": 222}}}}}
+
+    async def fetcher():
+        return fixture
+
+    fake = FakeProvider([ChatResult(text="pong")])
+    fake.models = [{"id": "m", "capability": {}}]
+    orch = make_orchestrator(tmp_path, lambda **kw: fake)
+    orch.providers._catalog_data = {"providers": fixture}
+    orch.providers._catalog_fetcher = fetcher
+    result = await orch.connect_provider("", protocol="openai",
+                                         base_url="https://api.example.com/v1",
+                                         model="m", api_key="sk-k")
+    assert result["ok"] is True
+    # 只允许 /v1 精确命中；/v1beta 不得串入
+    assert orch.provider_status()["roles"]["main"]["window"] == 222
+
+
+async def test_catalog_dot_local_hosts_excluded(tmp_path: Path) -> None:
+    """回归（审核残留）：.local 等私网后缀不参与地址匹配。"""
+    base = "http://myhost.local:1234/v1"
+    fixture = {"local-ish": {"api": base,
+                             "models": {"m": {"limit": {"context": 111}}}}}
+
+    async def fetcher():
+        return fixture
+
+    fake = FakeProvider([ChatResult(text="pong")])
+    fake.models = [{"id": "m", "capability": {}}]
+    orch = make_orchestrator(tmp_path, lambda **kw: fake)
+    orch.providers._catalog_data = {"providers": fixture}
+    orch.providers._catalog_fetcher = fetcher
+    result = await orch.connect_provider("", protocol="openai", base_url=base,
+                                         model="m", api_key="")
+    assert result["ok"] is True
+    assert orch.provider_status()["roles"]["main"]["window"] is None
+
+
+def test_opencode_go_preset_present() -> None:
+    """OpenCode Go：订阅网关，OpenAI 兼容，UI 有连接按钮（自己填 key 连）。"""
+    spec = PRESETS["opencode-go"]
+    assert spec["label"] == "OpenCode Go"
+    assert spec["protocol"] == "openai"
+    assert spec["base_url"] == "https://opencode.ai/zen/go/v1"
+    assert spec["model"] == "deepseek-v4.1-flash"
+    assert spec["needs_key"] is True
+
+
+async def test_disconnect_deletes_key_unbinds_and_keeps_row(tmp_path: Path) -> None:
+    """断开：删凭据、解绑角色、条目保留；换 key 可直接重连。"""
+    orch = make_orchestrator(tmp_path, lambda **kw: FakeProvider([ChatResult(text="pong")]))
+    await orch.connect_provider("main", **CONNECT)
+    pid = derive_provider_id("openai", None)
+    assert load_keys(tmp_path / "keys.json")[pid] == "sk-live"
+
+    result = orch.disconnect_provider(pid)
+
+    assert result["ok"] is True
+    assert pid not in load_keys(tmp_path / "keys.json")
+    assert orch.main_provider is None                       # 角色已解绑
+    status = orch.provider_status()
+    entry = next(p for p in status["providers"] if p["id"] == pid)
+    assert entry["configured"] is False and entry["has_key"] is False
+    assert status["roles"]["main"]["configured"] is False
+    again = await orch.connect_provider("main", **{**CONNECT, "api_key": "sk-new"})
+    assert again["ok"] is True
+    assert load_keys(tmp_path / "keys.json")[pid] == "sk-new"   # 换 key 重连成功
+
+
+async def test_disconnect_without_key_is_rejected(tmp_path: Path) -> None:
+    orch = make_orchestrator(tmp_path, lambda **kw: FakeProvider([ChatResult(text="pong")]))
+    result = orch.disconnect_provider(derive_provider_id("openai", None))
+    assert result["ok"] is False and "凭据" in result["message"]
+
+
+async def test_disconnect_message_flow_emits_status(tmp_path: Path) -> None:
+    """WS 断开消息：provider_result + provider_status（has_key=False）都要广播。"""
+    fake = FakeProvider([ChatResult(text="pong")])
+    orch = make_orchestrator(tmp_path, lambda **kw: fake)
+    await orch.connect_provider("main", **CONNECT)
+    queue = orch.subscribe()
+    pid = derive_provider_id("openai", None)
+
+    orch.handle_client_message({"type": "disconnect_provider", "provider_id": pid})
+
+    result = await _until(queue, lambda e: e.get("type") == "provider_result")
+    assert result["ok"] is True
+    status = await _until(
+        queue,
+        lambda e: e.get("type") == "provider_status"
+        and all(p["has_key"] is False for p in e["providers"] if p["id"] == pid),
+    )
+    assert status["roles"]["main"]["configured"] is False
+
+
+async def test_disconnect_local_endpoint_keeps_role_usable(tmp_path: Path) -> None:
+    """本地端点：删显式 key 后仍可用占位运行，角色保持可用（只是 has_key 变 false）。"""
+    fake = FakeProvider([ChatResult(text="pong")])
+    orch = make_orchestrator(tmp_path, lambda **kw: fake)
+    key = dict(protocol="openai", base_url="http://127.0.0.1:9/v1", model="m",
+               api_key="sk-local")
+    await orch.connect_provider("main", **key)
+    pid = derive_provider_id("openai", "http://127.0.0.1:9/v1")
+    assert load_keys(tmp_path / "keys.json")[pid] == "sk-local"
+
+    result = orch.disconnect_provider(pid)
+
+    assert result["ok"] is True
+    assert pid not in load_keys(tmp_path / "keys.json")
+    assert orch.main_provider is fake                     # 本地端点仍可用
+    entry = next(p for p in orch.provider_status()["providers"] if p["id"] == pid)
+    assert entry["has_key"] is False and entry["configured"] is True

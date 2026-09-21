@@ -27,3 +27,11 @@ def _guard_real_keystore():
         f"测试改写了真实密钥文件 {REAL_KEYS}！"
         "请为相关测试显式传入 keys_path，或依赖 conftest 的默认路径隔离。"
     )
+
+
+@pytest.fixture(autouse=True)
+def _no_real_catalog_fetch(monkeypatch):
+    """默认套件零网络：测试中禁止真实拉取 models.dev 目录。"""
+    async def _boom():
+        raise AssertionError("测试不得拉取 models.dev（外部网络）")
+    monkeypatch.setattr("agent.core.provider_manager.fetch_catalog", _boom)

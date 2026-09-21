@@ -135,11 +135,22 @@ export function ringLabel(payload) {
 }
 
 export function effortLabel(effort) {
-  return { off: "关闭", low: "低", medium: "中", high: "高" }[effort] || effort || "默认";
+  return { off: "关闭", low: "低", medium: "中", high: "高", max: "最高" }[effort] || effort || "默认";
 }
 
 export function composerLayout(width) {
   return Number(width) < 760 ? "narrow" : "wide";
+}
+
+export function shouldStickToBottom(scrollHeight, scrollTop, clientHeight, slack = 40) {
+  // 时间线刷新后是否该跟随到底部：用户上翻查看历史时不得被拽回
+  return Number(scrollHeight) - Number(scrollTop) - Number(clientHeight) < slack;
+}
+
+export function liveBufferStale(round, inflightAssistantCount) {
+  // 实时缓冲是否已被 inflight 快照收录：按轮次身份判定，不靠文本包含。
+  // round = 缓冲创建时已完成的模型回合数；inflight 中 assistant 条数更多 → 本轮已入快照。
+  return Number(inflightAssistantCount) > Number(round ?? 0);
 }
 
 export function shouldDropShell(actions, subagents, bodyChildren) {
@@ -377,7 +388,7 @@ export function filterModels(models, query) {
    window / window_source / reasoning_mode / efforts（null=未知，[]=明确为空）/
    reasoning_returned / max_output / tools / provider_id / model */
 
-const SOURCE_LABELS = { user: "用户设置", provider: "provider 返回", unknown: "未知" };
+const SOURCE_LABELS = { user: "用户设置", provider: "provider 返回", catalog: "公共目录", unknown: "未知" };
 
 export function capabilityFormState(role) {
   const cap = role || {};
@@ -472,6 +483,7 @@ export function providerListState(providerStatus) {
       providerId: spec.provider_id || "",
       configured: Boolean(spec.configured),
       needsKey: spec.needs_key !== false,
+      hasKey: live ? Boolean(live.has_key) : false,
       modelCount: live ? live.model_count || 0 : 0,
     };
   });
@@ -485,6 +497,7 @@ export function providerListState(providerStatus) {
       providerId: p.id,
       configured: p.configured !== false,
       needsKey: false,
+      hasKey: Boolean(p.has_key),
       modelCount: p.model_count || 0,
       protocol: p.protocol || "",
       baseUrl: p.base_url || "",
@@ -534,4 +547,78 @@ export function connectRowPlan(row) {
     return row.protocol ? {kind: "key"} : {kind: "guide-advanced"};
   }
   return row.needsKey ? {kind: "key"} : {kind: "direct"};
+}
+
+
+export function effortChipVisible(roleStatus) {
+  return effortState({
+    reasoning_mode: roleStatus && roleStatus.reasoning_mode,
+    levels: roleStatus && roleStatus.efforts,
+  }).selectable;
+}
+
+export function ringVisible(window) {
+  return typeof window === "number" && window > 0;
+}
+
+
+export function roleEffortVisible(roleStatus) {
+  return Boolean(roleStatus && roleStatus.configured) && effortChipVisible(roleStatus);
+}
+
+
+export function executorMessageView(m) {
+  return {
+    role: m && m.role,
+    text: (m && m.content) || "",
+    reasoning: (m && m.reasoning) || "",
+    calls: ((m && m.tool_calls) || []).map((tc) => ({ name: tc.name, arguments: tc.arguments })),
+    isToolResult: Boolean(m && m.role === "tool"),
+  };
+}
+
+const CODE_SPAN = /(```[\s\S]*?```|~~~[\s\S]*?~~~|`[^`\n]*`)/g;
+const INDENTED = /^(?: {4}|\t)/;
+const MATH_SPAN = /(?<!\\)\$\$([\s\S]+?)(?<!\\)\$\$|\\\[([\s\S]+?)\\\]|\\\(([\s\S]+?)\\\)|(?<!\\)\$(?!\s)([^\s$](?:[^$\n]*?[^\s$])?)(?<!\\)\$(?!\d)/g;
+
+export function extractMath(text) {
+  // markdown 会吃掉 \( \[ 的反斜杠：先摘出公式留占位，再由 KaTeX 回填。
+  // 围栏/行内代码整段不动；缩进代码块按行判定（段首或空行后的缩进才是代码，
+  // 列表/段落的缩进续行仍是正文，公式照常提取）。
+  const items = [];
+  const replace = (seg, ranges) => seg.replace(MATH_SPAN, (match, d1, d2, i1, i2, offset) => {
+    if (ranges && ranges.some((r) => offset >= r[0] && offset <= r[1])) return match;
+    const tex = (d1 ?? d2 ?? i1 ?? i2 ?? "").trim();
+    if (!tex) return match;
+    const display = d1 !== undefined || d2 !== undefined;
+    items.push({tex: tex, display: display});
+    return `@@KATEX${items.length - 1}@@`;
+  });
+  const parts = String(text || "").split(CODE_SPAN);
+  const out = parts.map((seg, idx) => {
+    if (idx % 2 === 1) return seg;   // 代码段不动
+    return replace(seg, indentedCodeRanges(seg));
+  });
+  return {text: out.join(""), items: items};
+}
+
+function indentedCodeRanges(seg) {
+  // 缩进代码块的字符区间：段首或空行后的缩进行；列表/段落续行不算代码
+  const ranges = [];
+  const lines = seg.split("\n");
+  let pos = 0;
+  let start = -1;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    let isCode = false;
+    if (INDENTED.test(line)) {
+      const prev = i > 0 ? lines[i - 1] : "";
+      isCode = !(prev.trim() !== "" && !INDENTED.test(prev));
+    }
+    if (isCode && start < 0) start = pos;
+    if (!isCode && start >= 0) { ranges.push([start, pos - 1]); start = -1; }
+    pos += line.length + 1;
+  }
+  if (start >= 0) ranges.push([start, seg.length - 1]);
+  return ranges;
 }

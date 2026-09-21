@@ -153,3 +153,52 @@ def test_old_messages_table_migrates_columns_without_data_loss(tmp_path: Path) -
     assert [m.content for m in loaded] == ["旧消息"]
     assert loaded[0].reasoning is None and loaded[0].content_blocks is None
     store.close()
+
+
+def test_messages_stream_isolated(tmp_path):
+    """双流：main/executor 各自独立读写，互不干扰。"""
+    store = SessionStore(tmp_path / "s.db")
+    store.append("s1", [Message(role="user", content="指挥者消息")], "main")
+    store.append("s1", [Message(role="user", content="任务A"),
+                        Message(role="assistant", content="执行结果")], "executor")
+    store.append("s1", [Message(role="assistant", content="指挥者回复")], "main")
+    assert [m.content for m in store.load("s1", "main")] == ["指挥者消息", "指挥者回复"]
+    assert [m.content for m in store.load("s1", "executor")] == ["任务A", "执行结果"]
+    # 整段重写只影响本流
+    store.replace("s1", [Message(role="user", content="重写后")], "executor")
+    assert [m.content for m in store.load("s1", "executor")] == ["重写后"]
+    assert [m.content for m in store.load("s1", "main")] == ["指挥者消息", "指挥者回复"]
+
+
+def test_messages_stream_migration_from_old_db(tmp_path):
+    """旧库（无 stream 列）打开后补列，旧消息全部归入 main 流。"""
+    import sqlite3
+    path = tmp_path / "old.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        "CREATE TABLE messages (idx INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL,"
+        " role TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', tool_calls TEXT,"
+        " tool_call_id TEXT);")
+    conn.execute("INSERT INTO messages (session_id, role, content) VALUES ('s1','user','旧消息')")
+    conn.commit()
+    conn.close()
+    store = SessionStore(path)
+    rows = store.load("s1")
+    assert [m.content for m in rows] == ["旧消息"]
+    assert rows[0].content_blocks is None
+
+
+def test_reconcile_stale_tasks(tmp_path: Path) -> None:
+    """启动对账：running/queued 遗留任务标记 cancelled，终态任务不受影响。"""
+    store = SessionStore(tmp_path / "s.db")
+    try:
+        store.create_session("s1", "", "t")
+        store.create_task(1, "s1", None, "t", "p", "m", "prov", "running")
+        store.create_task(2, "s1", None, "t", "p", "m", "prov", "queued")
+        store.create_task(3, "s1", None, "t", "p", "m", "prov", "done")
+        assert store.reconcile_stale_tasks("s1") == 2
+        assert store.get_task("s1", 1)["status"] == "cancelled"
+        assert store.get_task("s1", 2)["status"] == "cancelled"
+        assert store.get_task("s1", 3)["status"] == "done"
+    finally:
+        store.close()

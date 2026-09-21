@@ -452,7 +452,7 @@ async def test_connect_with_preset_resolution(tmp_path: Path) -> None:
     assert result["ok"] is True
     assert received["protocol"] == "openai"
     assert received["base_url"] == "https://api.deepseek.com/v1"
-    assert received["model"] == "deepseek-chat"  # 空模型回落预设默认
+    assert received["model"] == "deepseek-flash"  # 空模型回落预设默认
 
 
 async def test_connect_with_preset_no_key_needed(tmp_path: Path) -> None:
@@ -527,3 +527,17 @@ def test_migrate_drops_sessions_without_project_id(tmp_path: Path) -> None:
     store.create_session("new", "p1", "新")
     assert store.list_sessions()[0]["id"] == "new"
     store.close()
+
+
+async def test_timeline_loose_events_include_user_to_executor(tmp_path: Path) -> None:
+    """无 turn 的会话：直连执行者的灰色提示进入 timeline 的 loose_events（刷新可见）。"""
+    store = SessionStore(tmp_path / "s.db")
+    orch = make_orch(tmp_path, store=store)
+    conv = next(iter(orch.conversations.values()))
+    conv.executor_message("你好执行者")
+    with TestClient(create_app(orch)) as client:
+        resp = client.get(f"/api/timeline?session={conv.id}")
+        data = resp.json()
+    loose = [e for e in data.get("loose_events", []) if e["type"] == "user_to_executor"]
+    assert loose and loose[0]["turn_id"] is None
+    assert "你好执行者" in loose[0]["text"]

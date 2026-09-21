@@ -3,6 +3,8 @@
 PRESETS: dict[str, dict] = {
     "kimi-coding": {
         "label": "Kimi Coding",
+        "catalog": "kimi-code-plan-cn",
+        "catalog_aliases": ("kimi-for-coding",),
         "protocol": "anthropic",
         "base_url": "https://api.kimi.com/coding/",
         "model": "kimi-for-coding",
@@ -10,13 +12,15 @@ PRESETS: dict[str, dict] = {
     },
     "deepseek": {
         "label": "DeepSeek",
+        "catalog": "deepseek",
         "protocol": "openai",
         "base_url": "https://api.deepseek.com/v1",
-        "model": "deepseek-chat",
+        "model": "deepseek-flash",
         "needs_key": True,
     },
     "glm": {
         "label": "智谱 GLM",
+        "catalog": "zai",
         "protocol": "openai",
         "base_url": "https://open.bigmodel.cn/api/paas/v4",
         "model": "glm-4.6",
@@ -24,6 +28,7 @@ PRESETS: dict[str, dict] = {
     },
     "qwen": {
         "label": "通义千问",
+        "catalog": "alibaba-cn",
         "protocol": "openai",
         "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
         "model": "qwen-plus",
@@ -31,6 +36,7 @@ PRESETS: dict[str, dict] = {
     },
     "openai": {
         "label": "OpenAI",
+        "catalog": "openai",
         "protocol": "openai",
         "base_url": None,
         "model": "gpt-5",
@@ -38,9 +44,17 @@ PRESETS: dict[str, dict] = {
     },
     "anthropic": {
         "label": "Anthropic",
+        "catalog": "anthropic",
         "protocol": "anthropic",
         "base_url": None,
         "model": "claude-sonnet-4-5",
+        "needs_key": True,
+    },
+    "opencode-go": {
+        "label": "OpenCode Go",
+        "protocol": "openai",
+        "base_url": "https://opencode.ai/zen/go/v1",
+        "model": "deepseek-v4.1-flash",
         "needs_key": True,
     },
     "ollama": {

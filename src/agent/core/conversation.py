@@ -14,14 +14,11 @@ from uuid import uuid4
 from ..providers import Message, Usage
 from ..tools import build_registry
 from .context import (
-    COMPACT_PROMPT,
-    SUMMARY_PREFIX,
-    approximate_tokens,
+    compact_messages,
     estimate_chars,
     estimate_tokens,
-    serialize_for_summary,
 )
-from .dispatch import Dispatcher, ExecutorUnconfigured, SubtaskEvent, TaskIncomplete
+from .dispatch import Dispatcher, SubtaskEvent
 from .events import (
     ACTIVITY_TEXT_DELTA,
     ACTOR_MAIN,
@@ -34,10 +31,6 @@ from .events import (
     SUBAGENT_FAILED,
     SUBAGENT_QUEUED,
     SUBAGENT_STARTED,
-    SUBAGENT_STEP,
-    SUBAGENT_TEXT_DELTA,
-    SUBAGENT_TOOL_FINISHED,
-    SUBAGENT_TOOL_STARTED,
     TASK_CANCELLED,
     TASK_DONE,
     TASK_ERROR,
@@ -55,9 +48,13 @@ from .events import (
     TURN_FAILED_EVENT,
     TURN_RUNNING,
     TURN_STARTED,
+    USER_TO_EXECUTOR,
+    _classify_status,
+    _preview,
 )
+from .executor_session import ExecutorSession
 from .loop import AgentLoop
-from .prompts import SUBAGENT_SYSTEM, build_main_system
+from .prompts import build_main_system
 
 _CONFIRM_TIMEOUT = 120
 _UNSET: object = object()  # _record_event 的 turn_id 未指定哨兵
@@ -90,8 +87,27 @@ class Conversation:
         self._driver_task: asyncio.Task | None = None
         self._turn_task: asyncio.Task | None = None
         self._pending_confirms: dict[str, asyncio.Future] = {}
+        self._executor = ExecutorSession(
+            session_id=session_id, project_id=project_id, registry=registry,
+            record_event=self._record_event, audit_call=self._audit_call,
+            confirm=self._confirm,
+        )
         self._compact_usage = Usage()
         self._current_turn_id: int | None = None
+        self._turn_anchor: Message | None = None  # 本回合首条 user 消息（压缩保护锚点）
+        self._direct_tasks: set[int] = set()      # 用户直连执行者的任务（不回报指挥者）
+        self._direct_dispatch = False             # 正在派发直连任务（供 _on_task_created 判定来源）
+        self._interrupted_task: int | None = None  # 当前故事里被用户中断的指挥者任务号
+        # 中断介入的派生直连任务 → 它对应的被中断任务号（报告按此取号，避免连续中断串号）
+        self._intervention_origin: dict[int, int] = {}
+        # 每个中断故事里用户对执行者说的话（按被中断任务号归档，交付后弹出）
+        self._intervention_prompts: dict[int, list[str]] = {}
+        stored_flag = (
+            registry.store.get_flag(session_id, "report_executor")
+            if registry.store is not None
+            else None
+        )
+        self._report_executor = stored_flag != "0"   # 默认回报；可在执行者栏开关
         self._task_turns: dict[int, int | None] = {}  # 任务派发时固定的 parent turn
         self._last_prompt_tokens: int | None = None  # 上一次请求的精确 input tokens
         self._last_prompt_epoch: int = -1
@@ -159,7 +175,7 @@ class Conversation:
         self._driver_task = asyncio.create_task(self._driver())
 
     async def shutdown(self) -> None:
-        self._dispatcher.cancel_all()
+        self._dispatcher.cancel_all("agent 服务关闭，任务被中断")
         if self._turn_task is not None and not self._turn_task.done():
             self._turn_task.cancel()
         if self._driver_task is not None:
@@ -176,7 +192,65 @@ class Conversation:
         """/stop：中断当前 turn 与全部运行中的 subagent。"""
         if self._turn_task is not None and not self._turn_task.done():
             self._turn_task.cancel()
-        self._dispatcher.cancel_all()
+        self._dispatcher.cancel_all("用户手动中断（点击了指挥者栏的停止按钮）")
+
+    def executor_stop(self) -> None:
+        """/executor_stop：只中断执行者的运行/排队任务，不动指挥者回合。"""
+        self._dispatcher.cancel_all("用户手动中断（点击了执行者栏的停止按钮）")
+
+    def executor_report(self) -> bool:
+        """执行者结果（含中断介入）是否回报指挥者。"""
+        return self._report_executor
+
+    def set_executor_report(self, on: bool) -> None:
+        self._report_executor = bool(on)
+        if not self._report_executor:
+            # 关闭回报=不让指挥者卷进来：清掉未交付的中断故事，避免以后补发旧话
+            self._interrupted_task = None
+            self._intervention_origin.clear()
+            self._intervention_prompts.clear()
+        if self._registry.store is not None:
+            self._registry.store.set_flag(self.id, "report_executor", "1" if on else "0")
+
+    def executor_inflight(self) -> list[Message]:
+        """执行者进行中任务的未持久化消息（供 /api/executor_messages 拼接展示）。"""
+        return self._executor.inflight_messages()
+
+    def _dispatch_direct(self, text: str) -> int:
+        """派发"用户直连执行者"的任务：默认只留在窗口；中断介入的派生任务会回报指挥者。"""
+        self._direct_dispatch = True
+        try:
+            return self._dispatcher.dispatch(text)
+        finally:
+            self._direct_dispatch = False
+
+    def _anchor_turn(self) -> int | None:
+        """灰色提示的归属 turn：当前 turn 优先，否则最近一个（刷新后仍在主时间线）。"""
+        if self._current_turn_id is not None:
+            return self._current_turn_id
+        store = self._registry.store
+        if store is not None:
+            turns = store.list_turns(self.id)
+            return turns[-1]["id"] if turns else None
+        return None
+
+    def executor_message(self, text: str) -> None:
+        """用户直接对执行者说话：执行中=插话（下一生效）；空闲=新任务。
+
+        主时间线只留一条灰色提示（不入指挥者上下文）。
+        """
+        self._record_event(USER_TO_EXECUTOR, actor="user", text=text,
+                           turn_id=self._anchor_turn())
+        if self._interrupted_task is not None and self._report_executor:
+            # 中断介入：按故事归档用户对执行者说的话（含执行中插话）
+            self._intervention_prompts.setdefault(self._interrupted_task, []).append(text)
+        busy = any(s in ("running", "queued") for s in self._dispatcher.tasks.values())
+        if busy:
+            self._executor.steer(text)
+            return
+        for leftover in self._executor.take_undelivered():
+            self._dispatch_direct(leftover)  # 迟到的插话：转成新任务
+        self._dispatch_direct(f"[用户直接对执行者说]\n{text}")
 
     def resolve_confirm(self, confirm_id: str, allow: bool) -> None:
         fut = self._pending_confirms.pop(confirm_id, None)
@@ -288,6 +362,7 @@ class Conversation:
         self._record_event(TURN_STARTED, actor=ACTOR_MAIN, text=user_text)
 
         working = [Message(role="system", content=self._system), *self._messages, *batch]
+        self._turn_anchor = next((m for m in batch if m.role == "user"), None)
         self._compact_usage = Usage()
         loop = AgentLoop(
             registry.main_provider,
@@ -316,6 +391,7 @@ class Conversation:
                 store.finish_turn(turn_id, TURN_ERROR)
             self._record_event(TURN_FAILED_EVENT, actor=ACTOR_MAIN, text=f"{type(e).__name__}: {e}")
             raise
+        self._turn_anchor = None
         # 压缩/截断可能已改写 working：整段替换（去掉 system），持久化同步整段重写
         self._messages = working[1:]
         self._epoch += 1
@@ -371,51 +447,18 @@ class Conversation:
 
     async def _compact(self, messages: list[Message]) -> None:
         """接近动态阈值时把旧历史压成 [前情摘要] 替换。只在 user 边界切割。"""
-        provider = self._registry.main_provider
-        budget = self._registry.context_budget("main")
-        if provider is None or budget is None:
+        registry = self._registry
+        budget = registry.context_budget("main")
+        if registry.main_provider is None or budget is None:
             return
-        threshold_tokens = budget["compact_at"]
-        if estimate_tokens(messages, tool_specs=self._main_tools.specs()) < threshold_tokens:
-            return
-        keep_head = 1 if messages and messages[0].role == "system" else 0
-        body = messages[keep_head:]
-        budget_chars = max(2_000, int((threshold_tokens // 4) * 3.5))
-        cut = len(body)
-        size = 0
-        while cut > 1 and size < budget_chars:
-            m = body[cut - 1]
-            size += len(m.content) + sum(len(str(tc.arguments)) for tc in m.tool_calls or [])
-            if size <= budget_chars:
-                cut -= 1
-        # recent 不得以 tool 结果开头（其调用在 old 里，压缩后会成孤链）
-        while cut < len(body) and body[cut].role == "tool":
-            cut += 1
-        old, recent = body[:cut], body[cut:]
-        if not old:
-            return
-        before = estimate_chars(messages)
-        serialized = serialize_for_summary(old, before)  # old ⊆ messages，不再二次截断
-        result = await provider.chat(
-            [Message(role="user", content=f"{COMPACT_PROMPT}\n\n{serialized}")]
+        compacted = await compact_messages(
+            messages, provider=registry.main_provider,
+            budget_tokens=budget["compact_at"], tool_specs=self._main_tools.specs(),
+            on_compacted=self._emit, usage=self._compact_usage,
+            preserve=self._turn_anchor,
         )
-        self._compact_usage.input_tokens += result.usage.input_tokens
-        self._compact_usage.output_tokens += result.usage.output_tokens
-        messages[keep_head:] = [
-            Message(role="user", content=f"{SUMMARY_PREFIX}\n{result.text}"),
-            *recent,
-        ]
-        after = estimate_chars(messages)
-        self._epoch += 1
-        self._emit(
-            {
-                "type": "compacted",
-                "before": before,
-                "after": after,
-                "before_tokens": approximate_tokens(before),
-                "after_tokens": approximate_tokens(after),
-            }
-        )
+        if compacted:
+            self._epoch += 1
 
     def _on_subtask_event(self, event: SubtaskEvent) -> None:
         # TaskRun 持久化 + 新版执行事件（turn 归属固定为派发时的 parent turn）
@@ -465,8 +508,18 @@ class Conversation:
                 SUBAGENT_FAILED, actor=ACTOR_SUBAGENT, task_id=event.id,
                 turn_id=turn, status=event.status, text=event.output,
             )
+        direct = event.id in self._direct_tasks
+        if (terminal and not direct and event.status == "cancelled"
+                and self._report_executor):
+            self._interrupted_task = event.id            # 记下被用户中断的任务，等介入结果
+            self._intervention_prompts.setdefault(event.id, [])
         if terminal:
             self._task_turns.pop(event.id, None)
+            self._direct_tasks.discard(event.id)
+            if event.status in ("done", "incomplete", "error"):
+                # 任务正常/异常结束：未送达的插话转成新任务（用户主动停止时不自动重开）
+                for leftover in self._executor.take_undelivered():
+                    self._dispatch_direct(leftover)
         # 旧总线事件（CLI 兼容）
         status_text = {
             "done": "完成", "error": "出错", "cancelled": "中断", "unconfigured": "未配置",
@@ -475,14 +528,32 @@ class Conversation:
         self._emit(
             {"type": "task_update", "id": event.id, "status": event.status, "output": event.output}
         )
-        if event.status != "running":
+        if event.status != "running" and not direct:
             # running 仅作 UI/持久化通知；唤醒 main 会白跑一轮 LLM
+            # 直连执行者的任务不回报指挥者（它没派过，避免"任务完成"误导）
             self._inbox.put_nowait(
                 Message(role="user", content=f"[任务 #{event.id} {status_text}]\n{event.output}")
             )
+        elif event.status != "running" and event.id in self._intervention_origin:
+            # 中断介入：把"被中断的任务 + 用户的话 + 执行者输出"一并回报指挥者
+            interrupted = self._intervention_origin.pop(event.id)
+            prompts = "；".join(self._intervention_prompts.pop(interrupted, [])) or "（无文字指令）"
+            if self._report_executor:
+                self._inbox.put_nowait(Message(role="user", content=(
+                    f"[任务 #{interrupted} 被用户中断介入]\n"
+                    f"用户对执行者说：{prompts}\n"
+                    f"执行者输出：{event.output}"
+                )))
 
     def _on_task_created(self, task_id: int, title: str, prompt: str) -> None:
         """派发即登记 TaskRun（queued）并广播；parent turn 此刻固定。"""
+        if self._direct_dispatch:
+            self._direct_tasks.add(task_id)
+            if self._interrupted_task is not None and self._report_executor:
+                # 记住来源任务号：之后即使又发生新的中断，本任务仍回报它纠偏的那个
+                self._intervention_origin[task_id] = self._interrupted_task
+        else:
+            self._interrupted_task = None               # 指挥者重新派活：上一段中断故事翻篇
         registry = self._registry
         model = getattr(registry.executor_provider, "_model", "") or ""
         provider = type(registry.executor_provider).__name__ if registry.executor_provider else ""
@@ -506,119 +577,5 @@ class Conversation:
         self._inbox.put_nowait(Message(role="user", content=content))
 
     def _spawn_subagent(self, task_id: int, prompt: str, extra_tools: list):
-        """构造 subagent 的一次执行。plan 模式下写与 shell 工具物理缺席。"""
-        registry = self._registry
-        if registry.executor_provider is None:
-            raise ExecutorUnconfigured("executor 未配置，任务未执行（请先连接 executor）")
-        turn = self._sub_turn(task_id)
-        tools = build_registry(
-            self._root(),
-            write=not registry.plan_mode,
-            shell=not registry.plan_mode,
-            on_call=self._audit_call,
-            confirm=self._confirm,
-        )
-        for tool in extra_tools:
-            tools.add(tool)
-
-        def on_text(text: str) -> None:
-            self._record_event(
-                SUBAGENT_TEXT_DELTA, actor=ACTOR_SUBAGENT, task_id=task_id,
-                turn_id=turn, text=text,
-            )
-
-        def on_tool(call, payload: str | None, phase: str) -> None:
-            if phase == "started":
-                if registry.store is not None:
-                    # 最近动作属 actions 维度；步数（模型回合）由 on_step 单独维护
-                    registry.store.update_task(
-                        task_id, self.id, TASK_RUNNING,
-                        last_action=f"{call.name} {_preview(str(call.arguments), 60)}",
-                        actions_used_delta=1,
-                    )
-                self._record_event(
-                    SUBAGENT_TOOL_STARTED, actor=ACTOR_SUBAGENT, task_id=task_id,
-                    turn_id=turn, name=call.name, arguments=_preview(str(call.arguments)),
-                )
-            else:
-                self._record_event(
-                    SUBAGENT_TOOL_FINISHED, actor=ACTOR_SUBAGENT, task_id=task_id,
-                    turn_id=turn, name=call.name, status=_classify_status("finished", payload),
-                    result=_preview(payload or ""),
-                )
-
-        def on_reasoning(chunk: str) -> None:
-            self._record_event(
-                REASONING_DELTA, actor=ACTOR_SUBAGENT, task_id=task_id,
-                turn_id=turn, text=chunk,
-            )
-
-        def on_step(step: int) -> None:
-            """步数 = 已完成的模型回合数；落库 + 广播，运行中与结束值同一口径。"""
-            if registry.store is not None:
-                registry.store.update_task(task_id, self.id, TASK_RUNNING, steps_used=step)
-            self._registry.emit(
-                {
-                    "type": SUBAGENT_STEP, "session": self.id, "turn_id": turn,
-                    "actor": ACTOR_SUBAGENT, "task_id": task_id,
-                    "steps_used": step, "max_steps": registry.max_steps_executor,
-                }
-            )
-
-        executor_budget = registry.context_budget("executor")
-        loop = AgentLoop(
-            registry.executor_provider,
-            tools,
-            max_steps=registry.max_steps_executor,
-            on_tool_event=on_tool,
-            on_step=on_step,
-            on_reasoning=on_reasoning,
-            max_context_tokens=executor_budget["compact_at"] if executor_budget else None,
-        )
-        messages = [
-            Message(role="system", content=SUBAGENT_SYSTEM),
-            Message(role="user", content=prompt),
-        ]
-
-        async def go() -> str:
-            result = await loop.run(messages, on_text=on_text)
-            if registry.store is not None:
-                registry.store.update_task(
-                    task_id, self.id, TASK_RUNNING,
-                    steps_used=result.steps, stop_reason=result.stop_reason,
-                )
-            if result.stop_reason == "completed":
-                return result.text
-            raise TaskIncomplete(result.stop_reason, STOP_REASON_TEXT.get(
-                result.stop_reason, result.stop_reason
-            ))
-
-        return go()
-
-
-def _preview(text: str, limit: int = 200) -> str:
-    return text if len(text) <= limit else text[:limit] + "…"
-
-
-STOP_REASON_TEXT = {
-    "max_steps": "已达最大步数上限",
-    "no_progress": "连续重复相同操作，无进展",
-    "context_budget": "上下文预算不足",
-    "cancelled": "已被用户中断",
-}
-
-
-def _classify_status(phase: str, payload: str | None) -> str:
-    """从阶段与结果文本推断状态（审计与 execution events 共用）。"""
-    if phase == "started":
-        return "started"
-    if phase == "error":
-        return "error"
-    text = payload or ""
-    if text.startswith("已被用户拒绝"):
-        return "denied"
-    if text.startswith("超时"):
-        return "timeout"
-    if text.startswith("错误"):
-        return "error"
-    return "success"
+        """构造 subagent 的一次执行：委托给持续上下文的执行者会话。"""
+        return self._executor.spawn(task_id, prompt, extra_tools, turn=self._sub_turn(task_id))

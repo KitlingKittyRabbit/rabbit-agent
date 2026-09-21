@@ -24,7 +24,8 @@ CREATE TABLE IF NOT EXISTS messages (
     tool_calls TEXT,
     tool_call_id TEXT,
     reasoning TEXT,
-    content_blocks TEXT
+    content_blocks TEXT,
+    stream TEXT NOT NULL DEFAULT 'main'
 );
 CREATE TABLE IF NOT EXISTS turns (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -56,6 +57,12 @@ CREATE TABLE IF NOT EXISTS task_runs (
     actions_used INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (session_id, id)
 );
+CREATE TABLE IF NOT EXISTS session_flags (
+    session_id TEXT NOT NULL,
+    key TEXT NOT NULL,
+    value TEXT NOT NULL,
+    PRIMARY KEY (session_id, key)
+);
 CREATE TABLE IF NOT EXISTS execution_events (
     idx INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id TEXT NOT NULL,
@@ -80,6 +87,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("DROP TABLE messages")
         cols = []
     if cols:
+        if "stream" not in cols:
+            conn.execute("ALTER TABLE messages ADD COLUMN stream TEXT NOT NULL DEFAULT 'main'")
         for column in ("reasoning", "content_blocks"):
             if column not in cols:
                 conn.execute(f"ALTER TABLE messages ADD COLUMN {column} TEXT")
@@ -243,6 +252,33 @@ class SessionStore:
         )
         self._conn.commit()
 
+    def get_flag(self, session_id: str, key: str, default: str | None = None) -> str | None:
+        row = self._conn.execute(
+            "SELECT value FROM session_flags WHERE session_id = ? AND key = ?",
+            (session_id, key),
+        ).fetchone()
+        return row[0] if row else default
+
+    def set_flag(self, session_id: str, key: str, value: str) -> None:
+        self._conn.execute(
+            "INSERT INTO session_flags (session_id, key, value) VALUES (?, ?, ?)"
+            " ON CONFLICT(session_id, key) DO UPDATE SET value = excluded.value",
+            (session_id, key, value),
+        )
+        self._conn.commit()
+
+    def reconcile_stale_tasks(self, session_id: str) -> int:
+        """启动对账：把上次进程遗留的 running/queued 任务标记为 cancelled，返回条数。"""
+        from .events import TASK_CANCELLED
+
+        cur = self._conn.execute(
+            "UPDATE task_runs SET status = ?, completed_at = COALESCE(completed_at, ?)"
+            " WHERE session_id = ? AND status IN ('running', 'queued')",
+            (TASK_CANCELLED, time.time(), session_id),
+        )
+        self._conn.commit()
+        return cur.rowcount
+
     def get_task(self, session_id: str, task_id: int) -> dict | None:
         row = self._conn.execute(
             "SELECT id, parent_turn_id, title, prompt, model, provider, status, created_at,"
@@ -358,11 +394,11 @@ class SessionStore:
             for r in rows
         ]
 
-    # ---- 消息表 ----
-    def append(self, session_id: str, messages: list[Message]) -> None:
+    # ---- 消息表（stream 双流：main=指挥者 / executor=执行者，各自独立历史） ----
+    def append(self, session_id: str, messages: list[Message], stream: str = "main") -> None:
         self._conn.executemany(
             "INSERT INTO messages (session_id, role, content, tool_calls, tool_call_id,"
-            " reasoning, content_blocks) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            " reasoning, content_blocks, stream) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             [
                 (
                     session_id,
@@ -380,16 +416,19 @@ class SessionStore:
                         if m.content_blocks
                         else None
                     ),
+                    stream,
                 )
                 for m in messages
             ],
         )
         self._conn.commit()
 
-    def replace(self, session_id: str, messages: list[Message]) -> None:
-        """整段重写某会话（上下文压缩/截断后历史被改写，append 不再适用）。"""
-        self._conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
-        self.append(session_id, messages)
+    def replace(self, session_id: str, messages: list[Message], stream: str = "main") -> None:
+        """整段重写某条流（上下文压缩/截断后历史被改写，append 不再适用）。"""
+        self._conn.execute(
+            "DELETE FROM messages WHERE session_id = ? AND stream = ?", (session_id, stream)
+        )
+        self.append(session_id, messages, stream)
 
     @staticmethod
     def _load_blocks(raw: str | None) -> list[dict] | None:
@@ -404,11 +443,11 @@ class SessionStore:
             return None
         return [b for b in blocks if isinstance(b, dict)]
 
-    def load(self, session_id: str) -> list[Message]:
+    def load(self, session_id: str, stream: str = "main") -> list[Message]:
         rows = self._conn.execute(
             "SELECT role, content, tool_calls, tool_call_id, reasoning, content_blocks"
-            " FROM messages WHERE session_id = ? ORDER BY idx",
-            (session_id,),
+            " FROM messages WHERE session_id = ? AND stream = ? ORDER BY idx",
+            (session_id, stream),
         ).fetchall()
         out: list[Message] = []
         for role, content, tool_calls_json, tool_call_id, reasoning, blocks_json in rows:

@@ -46,3 +46,32 @@ REASONING_DELTA = "reasoning_delta"  # provider 明确返回的思考增量
 ACTOR_MAIN = "main"
 ACTOR_SUBAGENT = "subagent"
 ACTOR_SYSTEM = "system"
+
+USER_TO_EXECUTOR = "user_to_executor"  # 用户直接对执行者说话（主时间线灰色提示，不入指挥者上下文）
+
+STOP_REASON_TEXT = {
+    "max_steps": "已达最大步数上限",
+    "no_progress": "连续重复相同操作，无进展",
+    "context_budget": "上下文预算不足",
+    "cancelled": "已被用户中断",
+}
+
+
+def _preview(text: str, limit: int = 200) -> str:
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
+def _classify_status(phase: str, payload: str | None) -> str:
+    """从阶段与结果文本推断状态（审计与 execution events 共用）。"""
+    if phase == "started":
+        return "started"
+    if phase == "error":
+        return "error"
+    text = payload or ""
+    if text.startswith("已被用户拒绝"):
+        return "denied"
+    if text.startswith("超时"):
+        return "timeout"
+    if text.startswith("错误"):
+        return "error"
+    return "success"

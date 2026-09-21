@@ -29,7 +29,7 @@ from pathlib import Path
 
 from .keystore import save_key
 
-_PROVIDER_FIELDS = ("name", "protocol", "base_url")
+_PROVIDER_FIELDS = ("name", "protocol", "base_url", "catalog")
 _OVERRIDE_FIELDS = ("window", "reasoning_returned", "reasoning_mode", "levels",
                     "max_output", "tools")
 
@@ -78,6 +78,7 @@ def load_registry(path: str | Path) -> dict:
             "name": str(section.get("name") or pid),
             "protocol": str(section.get("protocol") or ""),
             "base_url": section.get("base_url"),
+            "catalog": str(section.get("catalog") or ""),
             "model_overrides": {},
         }
         overrides = section.get("model_overrides")
@@ -165,7 +166,7 @@ def save_registry(path: str | Path, registry: dict) -> None:
         lines.append(f'[providers."{pid}"]')
         for field in _PROVIDER_FIELDS:
             value = entry.get(field)
-            if value is not None:
+            if value is not None and value != "":
                 lines.append(f"{field} = {_format_value(value)}")
         lines.append("")
         fetched = entry.get("models_fetched_at") or 0.0

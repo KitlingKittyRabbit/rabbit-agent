@@ -69,6 +69,7 @@ class Dispatcher:
         self.tasks: dict[int, str] = {}
         self.current_turn_id: int | None = None
         self._running: dict[int, _Task] = {}
+        self._cancel_reasons: dict[int, str] = {}
 
     def make_tool(self) -> Tool:
         """call_subagent：主 agent 的派发工具。"""
@@ -136,10 +137,11 @@ class Dispatcher:
         self._running[task_id] = _Task(handle)
         return task_id
 
-    def cancel_all(self) -> None:
+    def cancel_all(self, reason: str = "用户手动中断") -> None:
         """中断所有运行中/排队中的任务（各自走 cancelled 分支发事件）。"""
         for task_id, task in self._running.items():
             if self.tasks.get(task_id) in ("running", "queued"):
+                self._cancel_reasons[task_id] = reason
                 task.handle.cancel()
 
     async def _run(self, task_id: int, prompt: str) -> None:
@@ -160,11 +162,13 @@ class Dispatcher:
             if self._writer_locks is not None
             else None
         )
+        acquired = False
+        coro: Awaitable[str] | None = None
         try:
-            if lock is not None:
-                await lock.acquire()  # 同一项目 writer 串行：拿不到锁就保持 queued
-            coro: Awaitable[str] | None = None
             try:
+                if lock is not None:
+                    await lock.acquire()  # 同一项目 writer 串行：拿不到锁就保持 queued
+                    acquired = True
                 # 先构造 spawn：executor 未配置等构造期异常不留下 running/started_at 痕迹
                 coro = self._spawn(task_id, prompt, [ask_tool])
                 self.tasks[task_id] = "running"
@@ -175,7 +179,10 @@ class Dispatcher:
                 self._notify(SubtaskEvent(id=task_id, status="done", output=output))
             except asyncio.CancelledError:
                 self.tasks[task_id] = "cancelled"
-                self._notify(SubtaskEvent(id=task_id, status="cancelled", output="已被用户中断"))
+                self._notify(SubtaskEvent(
+                    id=task_id, status="cancelled",
+                    output=self._cancel_reasons.pop(task_id, "用户手动中断"),
+                ))
             except ExecutorUnconfigured as e:
                 self.tasks[task_id] = "unconfigured"
                 self._notify(SubtaskEvent(id=task_id, status="unconfigured", output=str(e)))
@@ -189,12 +196,12 @@ class Dispatcher:
                 self._notify(
                     SubtaskEvent(id=task_id, status="error", output=f"{type(e).__name__}: {e}")
                 )
-            finally:
-                if coro is not None:
-                    coro.close()  # 未 await 的协程必须关闭，防 "never awaited" 告警
-                if lock is not None:
-                    lock.release()
         finally:
+            if coro is not None:
+                coro.close()  # 未 await 的协程必须关闭，防 "never awaited" 告警
+            if acquired and lock is not None:
+                lock.release()
+            self._cancel_reasons.pop(task_id, None)
             self._running.pop(task_id, None)
 
     def _notify(self, event: SubtaskEvent) -> None:

@@ -16,11 +16,14 @@ from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+from fastapi.staticfiles import StaticFiles
 
 from ..tools import build_registry
 from ..tools.base import ToolError
 
 WEB_DIR = Path(__file__).resolve().parents[3] / "web"
+HEADERS_NO_STORE = {"Cache-Control": "no-store"}
+
 _TOKEN_PLACEHOLDER = "__AGENT_TOKEN__"
 _LOCAL_HOSTS = {"127.0.0.1", "localhost"}
 
@@ -73,28 +76,36 @@ def create_app(orchestrator, token: str = "") -> FastAPI:
             with contextlib.suppress(asyncio.CancelledError):
                 await pump
 
+    if (WEB_DIR / "katex").is_dir():
+        app.mount("/katex", StaticFiles(directory=WEB_DIR / "katex"), name="katex")
+
     @app.get("/", response_class=HTMLResponse)
     async def index() -> HTMLResponse:
         html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
-        return HTMLResponse(html.replace(_TOKEN_PLACEHOLDER, token))
+        return HTMLResponse(html.replace(_TOKEN_PLACEHOLDER, token),
+                            headers=HEADERS_NO_STORE)
 
     @app.get("/marked.min.js")
     async def marked_js() -> FileResponse:
-        return FileResponse(WEB_DIR / "marked.min.js", media_type="text/javascript")
+        return FileResponse(WEB_DIR / "marked.min.js", media_type="text/javascript",
+                            headers=HEADERS_NO_STORE)
 
     @app.get("/styles.css")
     async def styles_css() -> FileResponse:
-        return FileResponse(WEB_DIR / "styles.css", media_type="text/css")
+        return FileResponse(WEB_DIR / "styles.css", media_type="text/css",
+                            headers=HEADERS_NO_STORE)
 
     @app.get("/app.js")
     async def app_js() -> Response:
         # token 注入：占位符在 app.js，页面脚本从这里拿实时 token
         script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
-        return Response(script.replace(_TOKEN_PLACEHOLDER, token), media_type="text/javascript")
+        return Response(script.replace(_TOKEN_PLACEHOLDER, token),
+                        media_type="text/javascript", headers=HEADERS_NO_STORE)
 
     @app.get("/timeline_logic.mjs")
     async def timeline_logic_js() -> FileResponse:
-        return FileResponse(WEB_DIR / "timeline_logic.mjs", media_type="text/javascript")
+        return FileResponse(WEB_DIR / "timeline_logic.mjs", media_type="text/javascript",
+                            headers=HEADERS_NO_STORE)
 
     @app.get("/api/ls")
     async def api_ls(
@@ -154,9 +165,48 @@ def create_app(orchestrator, token: str = "") -> FastAPI:
         for turn in turns:
             turn["events"] = store.list_events(session, turn_id=turn["id"])
         tasks = store.list_tasks(session)
+        loose = [e for e in store.list_events(session) if e["turn_id"] is None]
         return JSONResponse(
-            {"turns": turns, "tasks": tasks, "context": _session_context(orchestrator, session)}
+            {"turns": turns, "tasks": tasks, "loose_events": loose,
+             "context": _session_context(orchestrator, session)}
         )
+
+    @app.get("/api/executor_messages")
+    async def api_executor_messages(
+        session: str = Query(...), token: str = Query("")
+    ) -> JSONResponse:
+        """执行者会话完整历史（store 流 "executor" 的消息）。"""
+        if not _token_ok(token):
+            return JSONResponse({"error": "未授权"}, status_code=401)
+        store = orchestrator.store
+        if store is None:
+            return JSONResponse({"messages": []})
+        msgs = store.load(session, "executor")
+        conv = orchestrator.conversations.get(session)
+        inflight = conv.executor_inflight() if conv is not None else []
+        return JSONResponse({"messages": [
+            {
+                "role": m.role,
+                "content": m.content,
+                "reasoning": m.reasoning,
+                "tool_calls": [
+                    {"name": tc.name, "arguments": tc.arguments}
+                    for tc in (m.tool_calls or [])
+                ],
+            }
+            for m in msgs
+        ], "inflight": [
+            {
+                "role": m.role,
+                "content": m.content,
+                "reasoning": m.reasoning,
+                "tool_calls": [
+                    {"name": tc.name, "arguments": tc.arguments}
+                    for tc in (m.tool_calls or [])
+                ],
+            }
+            for m in inflight
+        ], "report": conv.executor_report() if conv is not None else True})
 
     @app.get("/api/task")
     async def api_task(

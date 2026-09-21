@@ -705,40 +705,49 @@ async def test_subagent_no_progress_tags_incomplete(tmp_path: Path) -> None:
     store.close()
 
 
-async def test_subagent_context_budget_tags_incomplete(tmp_path: Path) -> None:
-    """executor 上下文预算不足 → context_budget → incomplete。"""
+async def test_executor_compacts_instead_of_bricking(tmp_path: Path) -> None:
+    """executor 上下文逼近预算 → 压缩继续完成，不再硬停砖化（V1 回归）。"""
     from agent.core.session import SessionStore
 
-    executor = FakeProvider([ChatResult(text="不应调用")])
-    main = FakeProvider(
-        [
-            ChatResult(tool_calls=[ToolCall(id="m1", name="call_subagent",
-                                            arguments={"prompt": "长" * 5000})],
-                       stop_reason="tool_use"),
-            ChatResult(text="已派发"),
-            ChatResult(text="确认"),
-        ]
-    )
+    executor = FakeProvider([
+        ChatResult(text="一轮完成"),
+        ChatResult(text="摘要"),        # 第二个任务前的压缩调用
+        ChatResult(text="二轮完成"),
+    ])
+    main = FakeProvider([ChatResult(text="x")])
     db = tmp_path / "s.db"
     orch = Orchestrator(main_provider=main, executor_provider=executor, root=tmp_path,
                         store=SessionStore(db))
-    orch.set_context_window("executor", 100)  # 预算下限 1024 tokens，触发预算停止
-    queue = orch.subscribe()
+    orch.set_context_window("executor", 100)  # 预算下限 1024 tokens
+    conv = orch.conversations[sid(orch)]
     await orch.start()
     try:
-        session = sid(orch)
-        orch.handle_client_message({"type": "user", "session": session, "text": "开始"})
-        await _until(queue, lambda e: e.get("type") == "task_update"
-                     and e.get("status") == "incomplete")
-        await _until(queue, _is_turn_end)
-        await _until(queue, _is_turn_end)
+        conv._dispatcher.dispatch("任务一 " + "长" * 2000)
+        await _wait_for(lambda: conv._dispatcher.tasks.get(1) == "done")
+        conv._dispatcher.dispatch("任务二 " + "长" * 2000)
+        await _wait_for(lambda: conv._dispatcher.tasks.get(2) == "done")
     finally:
         await orch.stop()
     store = SessionStore(db)
-    task = store.get_task(session, 1)
-    assert task["status"] == "incomplete"
-    assert task["stop_reason"] == "context_budget"
+    session = conv.id
+    task1 = store.get_task(session, 1)
+    task2 = store.get_task(session, 2)
+    assert task1["status"] == "done" and task2["status"] == "done"
+    exec_msgs = store.load(session, "executor")
+    assert any("前情摘要" in m.content for m in exec_msgs)  # 压缩过
+    assert any("任务二" in m.content for m in exec_msgs)    # 当前任务未被吞
+    assert any("二轮完成" in m.content for m in exec_msgs)  # 继续完成
     store.close()
+
+
+async def _wait_for(pred, timeout=5.0) -> None:
+    import asyncio as _a
+
+    async def _spin():
+        while not pred():
+            await _a.sleep(0.01)
+
+    await _a.wait_for(_spin(), timeout)
 
 
 async def test_restart_keeps_thinking_blocks_for_next_request(tmp_path: Path) -> None:
@@ -787,3 +796,135 @@ async def test_restart_keeps_thinking_blocks_for_next_request(tmp_path: Path) ->
     assert assistant.content_blocks == blocks
     assert [b["type"] for b in assistant.content_blocks] == ["thinking", "text", "tool_use"]
     assert assistant.content_blocks[0]["signature"] == "sig-restart-1"
+
+
+async def test_compaction_never_swallows_last_user_message(tmp_path: Path) -> None:
+    """回归（审核 F4）：超大单条消息也不得把当前任务 prompt 卷进摘要。"""
+    from agent.core.context import compact_messages
+
+    fake = FakeProvider([ChatResult(text="摘要")])
+    messages = [
+        Message(role="system", content="sys"),
+        Message(role="user", content="旧" + "长" * 100),
+        Message(role="assistant", content="回复"),
+        Message(role="user", content="当前任务" + "长" * 4000),
+    ]
+    ok = await compact_messages(messages, provider=fake, budget_tokens=100, tool_specs=[])
+    assert ok is True
+    assert any("当前任务" in m.content for m in messages)
+    assert any("前情摘要" in m.content for m in messages)
+
+    single = [Message(role="system", content="sys"),
+              Message(role="user", content="长" * 5000)]
+    ok2 = await compact_messages(single, provider=FakeProvider([ChatResult(text="摘要")]),
+                                 budget_tokens=100, tool_specs=[])
+    assert ok2 is False and single[-1].content.startswith("长")  # 没有干净边界则不压
+
+
+async def test_compaction_keeps_current_task_mid_flight(tmp_path: Path) -> None:
+    """回归（审核 F3）：任务进行中压缩，必须保留当前任务 prompt 与其工具链。"""
+    from agent.core.context import compact_messages
+
+    fake = FakeProvider([ChatResult(text="摘要")])
+    messages = [
+        Message(role="system", content="sys"),
+        Message(role="user", content="旧任务" + "长" * 200),
+        Message(role="assistant", content="旧回复"),
+        Message(role="user", content="当前任务"),
+        Message(role="assistant", content="", tool_calls=[
+            ToolCall(id="t1", name="read", arguments={})]),
+        Message(role="tool", content="结果" + "长" * 4000, tool_call_id="t1"),
+    ]
+    ok = await compact_messages(messages, provider=fake, budget_tokens=100, tool_specs=[])
+    assert ok is True
+    assert any("当前任务" in m.content for m in messages)      # 进行中任务未被吞
+    assert any("前情摘要" in m.content for m in messages)      # 旧历史被压缩
+    # 链完整：每条 tool 消息前都有对应 assistant tool_call
+    seen_calls: set[str] = set()
+    for m in messages:
+        if m.role == "assistant":
+            seen_calls.update(tc.id for tc in (m.tool_calls or []))
+        elif m.role == "tool":
+            assert m.tool_call_id in seen_calls
+
+
+async def test_compaction_no_orphan_tool_when_cut_lands_on_tool(tmp_path: Path) -> None:
+    """回归（审核 G1）：切割点落在 tool 上时必须前移，recent 不得以孤儿工具结果开头。"""
+    from agent.core.context import compact_messages
+
+    fake = FakeProvider([ChatResult(text="摘要")])
+    big_args = {"data": "x" * 3000}
+    messages = [
+        Message(role="system", content="sys"),
+        Message(role="user", content="旧消息"),
+        Message(role="assistant", content="", tool_calls=[
+            ToolCall(id="t0", name="write", arguments=big_args)]),
+        Message(role="tool", content="旧结果", tool_call_id="t0"),
+        Message(role="user", content="当前任务"),
+        Message(role="assistant", content="", tool_calls=[
+            ToolCall(id="t1", name="read", arguments={})]),
+        Message(role="tool", content="当前结果", tool_call_id="t1"),
+    ]
+    ok = await compact_messages(messages, provider=fake, budget_tokens=100, tool_specs=[],
+                                preserve=messages[4])
+    assert ok is True
+    assert any("当前任务" in m.content for m in messages)
+    seen: set[str] = set()
+    for m in messages:
+        if m.role == "assistant":
+            seen.update(tc.id for tc in (m.tool_calls or []))
+        elif m.role == "tool":
+            assert m.tool_call_id in seen, "孤儿 tool 结果"
+
+
+async def test_compaction_anchor_survives_later_steer_message(tmp_path: Path) -> None:
+    """回归（审核 G2）：插话（新的 user 消息）不得让任务 prompt 失去保护。"""
+    from agent.core.context import compact_messages
+
+    fake = FakeProvider([ChatResult(text="摘要")])
+    task = Message(role="user", content="当前任务")
+    messages = [
+        Message(role="system", content="sys"),
+        Message(role="user", content="旧历史" + "长" * 2000),
+        task,
+        Message(role="assistant", content="", tool_calls=[
+            ToolCall(id="t1", name="read", arguments={})]),
+        Message(role="tool", content="大结果" + "长" * 2000, tool_call_id="t1"),
+        Message(role="user", content="[用户对执行者插话]\n换个方式"),
+    ]
+    # 尺寸切割会落在任务之后：只保护"最后一条 user"（插话）会把任务 prompt 卷入摘要
+    ok = await compact_messages(messages, provider=fake, budget_tokens=100, tool_specs=[],
+                                preserve=task)
+    assert ok is True
+    assert any("当前任务" in m.content for m in messages)   # 锚点仍在
+    assert any("插话" in m.content for m in messages)
+    seen: set[str] = set()
+    for m in messages:
+        if m.role == "assistant":
+            seen.update(tc.id for tc in (m.tool_calls or []))
+        elif m.role == "tool":
+            assert m.tool_call_id in seen
+
+
+async def test_conversation_compact_uses_turn_anchor(tmp_path: Path) -> None:
+    """主 agent 压缩必须使用本回合锚点（中途注入的任务完成消息不得挤掉用户指令）。"""
+    main = FakeProvider([ChatResult(text="摘要")])
+    orch = make_orch(tmp_path, main, FakeProvider([ChatResult(text="x")]))
+    orch.set_context_window("main", 100)
+    conv = orch.conversations[sid(orch)]
+    conv._messages = [Message(role="user", content="旧历史" + "长" * 2000)]
+    anchor = Message(role="user", content="本回合指令")
+    conv._turn_anchor = anchor
+    working = [
+        Message(role="system", content=conv._system),
+        *conv._messages,
+        anchor,
+        Message(role="assistant", content="", tool_calls=[
+            ToolCall(id="t1", name="read", arguments={})]),
+        Message(role="tool", content="大结果" + "长" * 2000, tool_call_id="t1"),
+        Message(role="user", content="[任务 #1 完成]\n结果来了"),  # 注入消息（新的最后 user）
+    ]
+    await conv._compact(working)
+    assert any("本回合指令" in m.content for m in working)     # 锚点未被吞
+    assert any("前情摘要" in m.content for m in working)       # 旧历史被压缩
+    assert any("任务 #1 完成" in m.content for m in working)

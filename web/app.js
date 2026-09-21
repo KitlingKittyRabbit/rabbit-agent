@@ -9,6 +9,7 @@ import {
   connectRowPlan,
   composerLayout,
   effortLabel,
+  executorMessageView,
   effortState,
   extractChanges,
   finalPreview,
@@ -16,28 +17,32 @@ import {
   groupActivityEvents,
   hasWork,
   inspectorLines,
+  extractMath,
   isSystemTurn,
+  liveBufferStale,
   mergeTask,
   modelMenuState,
   modelSelectAction,
   pairToolEvents,
   parentPath,
   planLabel,
-  planShort,
   planTaskCard,
   providerListState,
+  roleEffortVisible,
   roleModelOptions,
   reasoningTarget,
   ringLabel,
+  ringVisible,
   routeActionEvent,
   sessionLabel,
   shouldDropShell,
+  shouldStickToBottom,
   shortArg,
   taskCardAction,
   taskCardLines,
   taskStatusText,
   turnSummaryText,
-} from "./timeline_logic.mjs";
+} from "./timeline_logic.mjs?v=2";
 
 const $ = (id) => document.getElementById(id);
 const TOKEN = "__AGENT_TOKEN__";
@@ -46,7 +51,7 @@ const state = {
   tasks: {}, liveTurn: null, planMode: false, wantNewSession: false,
   providerStatus: null, liveTaskProgress: {}, turnsById: {},
   taskCards: {}, taskCardEls: {}, fsPath: ".",
-  modelCatalog: null,
+  modelCatalog: null, execLive: {},
 };
 
 /* ---------- 基础设施 ---------- */
@@ -66,8 +71,11 @@ async function api(path) {
 }
 function setStatus(text) { $("turn-status").textContent = text; }
 function renderPlanLabel() {
-  $("plan-label").textContent = planShort(state.planMode);
-  $("plan-label").title = planLabel(state.planMode);
+  $("plan-label").textContent = state.planMode ? "Plan" : "Build";
+  $("btn-plan-mode").title = planLabel(state.planMode);
+  document.querySelectorAll("#plan-menu .menu-item").forEach((el) => {
+    el.classList.toggle("active", (el.dataset.plan === "on") === state.planMode);
+  });
 }
 function stream() { return $("stream"); }
 function scrollDown() { const s = stream(); s.scrollTop = s.scrollHeight; }
@@ -131,7 +139,6 @@ function handle(ev) {
     state.providerStatus = ev;
     if (typeof ev.plan_mode === "boolean") {
       state.planMode = ev.plan_mode;
-      $("plan-toggle").checked = ev.plan_mode;
       renderPlanLabel();
     }
     renderProviderStatus();
@@ -141,15 +148,16 @@ function handle(ev) {
     state.modelCatalog = ev;
     renderModelModal();
     if (!$("modal-mask").classList.contains("hidden")) renderRoleSettings();
+    if (!$("tab-executor").classList.contains("hidden")) renderExecutorHeader();
+    if (state.providerStatus) renderModelButton(state.providerStatus.roles || {});
     return;
   }
   if (t === "plan_mode") {
     state.planMode = ev.on;
-    $("plan-toggle").checked = ev.on;
     renderPlanLabel();
     return;
   }
-  if (t === "session_list" || t === "task_list") { if (t === "task_list") renderTaskList(ev.tasks); return; }
+  if (t === "session_list") return;
 
   const sid = ev.session;
   if (sid && sid !== state.current) {
@@ -171,11 +179,25 @@ function handle(ev) {
   }
   if (t === "confirm_request") { confirmCard(ev); return; }
   if (t === "task_question") { note(`任务 #${ev.id} 提问: ${ev.question}`); return; }
+  if (t === "user_to_executor") {
+    // 用户直接对执行者说的话：主时间线灰色提示，执行者窗口同步刷新
+    note(`你对执行者说：${ev.text}`);
+    maybeRefreshExecutor(ev.session);
+    return;
+  }
   if (t === "error") { note(`[错误] ${ev.message}`); return; }
-  if (t === "stopped") { setStatus(""); note("[已中断]"); return; }
-  if (t === "turn_end") { setStatus(""); return; }
+  if (t === "executor_report") { renderExecReport(ev.on); return; }
+  if (t === "stopped") { setStatus(""); setBusy(false); note("[已中断]"); return; }
+  if (t === "turn_end") { setStatus(""); setBusy(false); return; }
 
   // 执行事件 → 时间线
+  const execDelta = t === "subagent_text_delta"
+    || (t === "reasoning_delta" && ev.actor === "subagent");
+  if (EXEC_EVENT_TYPES.has(t) && (t !== "reasoning_delta" || ev.actor === "subagent")
+      && !execDelta) {
+    clearExecLive(ev.task_id);      // 该轮已入 messages/inflight，实时缓冲退役
+    maybeRefreshExecutor(ev.session);
+  }
   routeExecution(ev);
 }
 
@@ -193,9 +215,9 @@ function renderRing(payload) {
   ring.style.strokeDasharray = `${circumference}`;
   ring.style.strokeDashoffset = `${circumference * (1 - info.percent / 100)}`;
   ring.classList.toggle("unknown", info.unknown);
-  $("ctx-ring-wrap").title = info.unknown
-    ? "上下文：未知模型，无可用上限"
-    : `上下文：${info.sub}`;
+  if (!$("ctx-ring-wrap").classList.contains("hidden")) {
+    $("ctx-ring-wrap").title = `上下文：${info.sub}`;
+  }
 }
 
 function renderUsageLine() {
@@ -242,13 +264,45 @@ function ensureShell(lt) {
 
 function renderFinalText(el, text) {
   const preview = finalPreview(text, 160);
-  el.innerHTML = sanitize(marked.parse(preview.text));
+  renderMarkdown(el, preview.text);
   if (!preview.truncated) return;
   const wrap = el.closest(".final") || el;
   const btn = document.createElement("button");
   btn.className = "final-toggle"; btn.textContent = "展开全文";
-  btn.onclick = () => { el.innerHTML = sanitize(marked.parse(text)); btn.remove(); };
+  btn.onclick = () => {
+    renderMarkdown(el, text);
+    btn.remove();
+  };
   wrap.appendChild(btn);
+}
+
+function renderMarkdown(el, text) {
+  const picked = extractMath(text);
+  const html = sanitize(marked.parse(picked.text));
+  el.innerHTML = html.replace(/@@KATEX(\d+)@@/g, (match, i) => {
+    const item = picked.items[Number(i)];
+    if (!item || typeof katex === "undefined") return match;
+    try {
+      return katex.renderToString(item.tex, {displayMode: item.display, throwOnError: false});
+    } catch (e) { return match; }
+  });
+}
+
+function renderMath(el) {
+  // LLM 习惯的 LaTeX 分隔符；代码块/行内代码不处理；失败保持原文
+  if (typeof renderMathInElement !== "function") return;
+  try {
+    renderMathInElement(el, {
+      delimiters: [
+        {left: "$$", right: "$$", display: true},
+        {left: "\\[", right: "\\]", display: true},
+        {left: "\\(", right: "\\)", display: false},
+        {left: "$", right: "$", display: false},
+      ],
+      ignoredTags: ["script", "noscript", "style", "textarea", "pre", "code"],
+      throwOnError: false,
+    });
+  } catch (e) { /* 渲染失败时保持原文展示 */ }
 }
 
 function reasoningDetails(container, label, beforeEl, extraClass = "") {
@@ -360,7 +414,7 @@ function ensureTaskCard(taskId, title, status, container) {
   card.innerHTML = `<div class="tc-title"></div><div class="tc-progress"></div>`;
   card.querySelector(".tc-title").textContent = lines.title;
   card.querySelector(".tc-progress").textContent = lines.line;
-  card.onclick = () => openInspector(taskId);
+  card.onclick = () => openExecutorTab();
   container.appendChild(card); state.taskCardEls[taskId] = card; scrollDown();
   return card;
 }
@@ -392,12 +446,15 @@ function updateTaskCard(taskId, status, output) {
   card.dataset.status = status;
   if (output) card.title = output.slice(0, 500);
   paintTaskCard(taskId);
-  refreshTasks();
 }
 
 /* ---------- 实时执行事件 ---------- */
 function routeExecution(ev) {
   const t = ev.type;
+  if (t === "subagent_text_delta") {
+    execAppendLive(ev.task_id, "text", ev.text || "");
+    return;
+  }
   if (t === "turn_started") {
     const turnEl = makeTurn();
     let shell = null;
@@ -410,6 +467,7 @@ function routeExecution(ev) {
     state.turnsById[ev.turn_id] = lt;
     state.liveTurn = lt;
     setStatus("Working…");
+    setBusy(true);
     return;
   }
   // 按事件自带 turn_id 路由：旧 subagent 的事件不会串进新 turn
@@ -420,6 +478,7 @@ function routeExecution(ev) {
       if (lt) appendReasoning(lt, ev.text || "");
     } else if (ev.task_id !== undefined && ev.task_id !== null) {
       appendTaskReasoning(ev.task_id, ev.text || "");
+      execAppendLive(ev.task_id, "reasoning", ev.text || "");
     }
     return;
   }
@@ -438,8 +497,10 @@ function routeExecution(ev) {
       ensureTaskCard(ev.task_id, action.title, action.status, ensureShell(lt).body);
       lt.subagents++;
       markTurnTask(lt, ev.task_id, action.status);
+    } else {
+      paintTaskCard(ev.task_id);
     }
-    upsertTask(ev.task_id, {title: action.title, status: action.status}); refreshTasks(); return;
+    upsertTask(ev.task_id, {title: action.title, status: action.status}); return;
   }
   if (t === "subagent_tool_started") {
     const prog = state.liveTaskProgress[ev.task_id] ||
@@ -449,11 +510,12 @@ function routeExecution(ev) {
       ensureTaskCard(ev.task_id, "", "running", ensureShell(lt).body);
       routeActionEvent(state.turnsById, ev);  // 旧任务事件只加旧 turn
       markTurnTask(lt, ev.task_id, "running");
+    } else {
+      paintTaskCard(ev.task_id);
     }
     prog.last = `${displayToolName(ev.name)} ${compactArgs(ev.name, ev.arguments)}`.trim();
     upsertTask(ev.task_id, {last_action: prog.last});
     paintTaskCard(ev.task_id);
-    refreshTasks();
     return;
   }
   if (t === "subagent_step") {
@@ -464,6 +526,8 @@ function routeExecution(ev) {
     if (lt) {
       ensureTaskCard(ev.task_id, "", "running", ensureShell(lt).body);
       markTurnTask(lt, ev.task_id, "running");
+    } else {
+      paintTaskCard(ev.task_id);
     }
     upsertTask(ev.task_id, {steps_used: action.steps, max_steps: action.maxSteps});
     paintTaskCard(ev.task_id);
@@ -476,8 +540,9 @@ function routeExecution(ev) {
     if (lt) {
       ensureTaskCard(ev.task_id, state.tasks[ev.task_id]?.title || "", action.status, ensureShell(lt).body);
       markTurnTask(lt, ev.task_id, action.status);
-    }
-    refreshTasks(); return;
+    } else {
+      paintTaskCard(ev.task_id);
+    } return;
   }
   if (t === "subagent_completed") {
     const action = taskCardAction(ev);
@@ -487,8 +552,9 @@ function routeExecution(ev) {
       ensureTaskCard(ev.task_id, state.tasks[ev.task_id]?.title || "", action.status, ensureShell(lt).body);
       updateTaskCard(ev.task_id, action.status, action.output);
       markTurnTask(lt, ev.task_id, action.status);
-    }
-    refreshTasks(); return;
+    } else {
+      paintTaskCard(ev.task_id);
+    } return;
   }
   if (t === "subagent_failed") {
     const action = taskCardAction(ev);
@@ -497,8 +563,9 @@ function routeExecution(ev) {
       ensureTaskCard(ev.task_id, state.tasks[ev.task_id]?.title || "", action.status, ensureShell(lt).body);
       updateTaskCard(ev.task_id, action.status, action.output);
       markTurnTask(lt, ev.task_id, action.status);
-    }
-    refreshTasks(); return;
+    } else {
+      paintTaskCard(ev.task_id);
+    } return;
   }
   if (t === "final_started") {
     if (lt) {
@@ -534,6 +601,7 @@ function finishLiveTurn(turnId, outcome) {
   if (state.liveTurn === lt) {
     state.liveTurn = null;
     setStatus("");
+    setBusy(false);
   }
   scrollDown();
 }
@@ -548,9 +616,13 @@ async function loadTimeline() {
   state.tasks = Object.fromEntries((data.tasks || []).map(t => [t.id, t]));
   state.context = data.context;
   renderRing(data.context);
+  setBusy((data.turns || []).some((t) => t.status === "running"));
   for (const turn of data.turns || []) renderHistoryTurn(turn);
-  refreshTasks();
+  for (const e of data.loose_events || []) {
+    if (e.type === "user_to_executor") note(`你对执行者说：${e.text || ""}`);
+  }
   scrollDown();
+  updateExecButton();
 }
 
 function renderHistoryTurn(turn) {
@@ -605,6 +677,14 @@ function renderHistoryTurn(turn) {
   } else if (isSystemTurn(turn)) {
     turnEl.appendChild(systemDivider());  // 事件驱动 turn：无用户消息、无动作
   }
+  for (const e of events) {
+    if (e.type === "user_to_executor") {
+      const hint = document.createElement("div");
+      hint.className = "msg-note";
+      hint.textContent = `你对执行者说：${e.text || ""}`;
+      turnEl.appendChild(hint);
+    }
+  }
   const mainReasoning = events
     .filter(e => e.type === "reasoning_delta" && e.task_id == null)
     .map(e => e.text || "")
@@ -630,82 +710,7 @@ function renderHistoryTurn(turn) {
 /* ---------- Task inspector ---------- */
 function upsertTask(id, patch) {
   state.tasks[id] = mergeTask(state.tasks[id], id, patch);
-}
-
-async function openInspector(taskId) {
-  const page = $("tab-tasks");
-  const data = await api(`/api/task?session=${state.current}&task=${taskId}`);
-  if (data.error || !data.task) { note(data.error || `任务不存在: #${taskId}`); return; }
-  const task = data.task, events = data.events || [];
-  page.innerHTML = "";
-  const wrap = document.createElement("div"); wrap.className = "inspector";
-  const dur = task.status === "unconfigured" ? "未执行" : fmtDur(task.started_at || task.created_at, task.completed_at);
-  const actions = events.filter(e => e.type === "subagent_tool_started").length;
-  const [progressLine, metaLine] = inspectorLines({
-    status: task.status, steps: task.steps_used, maxSteps: task.max_steps,
-    actions, lastAction: task.last_action, stopReason: task.stop_reason,
-    durationLabel: dur, model: task.model || "",
-  });
-  wrap.innerHTML = `
-    <div class="inspector-head">
-      <h4>Task #${task.id} · ${escapeHtml(task.title || "")}</h4>
-      <div class="meta">${escapeHtml(progressLine)}</div>
-      <div class="meta">${escapeHtml(metaLine)}</div>
-    </div>
-    <div class="inspector-tabs">
-      <button data-v="activity" class="active">Activity</button>
-      <button data-v="result">Result</button>
-      <button data-v="changes">Changes</button>
-      <button data-v="validation">Validation</button>
-    </div>
-    <div class="inspector-body"></div>`;
-  const back = document.createElement("button"); back.textContent = "← 任务列表";
-  back.onclick = () => { page.innerHTML = ""; refreshTasks(); };
-  const body = wrap.querySelector(".inspector-body");
-  const views = {
-    activity: () => renderActivity(body, events),
-    result: () => {
-      body.innerHTML = "";
-      if (task.status === "unconfigured") {
-        const noteEl = document.createElement("div");
-        noteEl.className = "act-row";
-        noteEl.textContent = "executor 未配置：任务未执行。请先连接 executor 后重新派发（重派=从头执行）";
-        body.appendChild(noteEl);
-      } else if (task.stop_reason === "max_steps") {
-        const noteEl = document.createElement("div");
-        noteEl.className = "act-row";
-        noteEl.textContent = "已达最大步数上限：任务可能未完成（需要时可重派一次，重派=从头执行）";
-        body.appendChild(noteEl);
-      } else if (task.status === "error") {
-        const noteEl = document.createElement("div");
-        noteEl.className = "act-row";
-        noteEl.textContent = "任务执行失败：原因见下方输出";
-        body.appendChild(noteEl);
-      }
-      const pre = document.createElement("pre"); pre.textContent = task.final_output || "(无输出)";
-      body.appendChild(pre);
-    },
-    changes: () => renderChanges(body, events),
-    validation: () => renderValidation(body, events),
-  };
-  wrap.querySelectorAll(".inspector-tabs button").forEach(btn => {
-    btn.onclick = () => {
-      wrap.querySelectorAll(".inspector-tabs button").forEach(b => b.classList.remove("active"));
-      btn.classList.add("active");
-      body.innerHTML = "";
-      views[btn.dataset.v]();
-    };
-  });
-  page.append(back, wrap);
-  // 切到任务页签
-  document.querySelectorAll(".tab").forEach(t => t.classList.remove("active"));
-  document.querySelector('.tab[data-tab="tasks"]').classList.add("active");
-  $("tab-files").classList.add("hidden");
-  page.classList.remove("hidden");
-  views.activity();
-}
-
-function renderActivity(body, events) {
+}function renderActivity(body, events) {
   body.innerHTML = "";
   for (const g of groupActivityEvents(events)) {
     const row = document.createElement("div"); row.className = "act-row";
@@ -750,30 +755,7 @@ function renderValidation(body, events) {
   }
 }
 
-/* ---------- 右栏任务列表 ---------- */
-function refreshTasks() {
-  if (!state.current) return;
-  const page = $("tab-tasks");
-  if (page.querySelector(".inspector")) return; // 正在看 inspector 不刷
-  page.innerHTML = "";
-  const tasks = Object.values(state.tasks).sort((a, b) => (b.id || 0) - (a.id || 0));
-  if (!tasks.length) { page.innerHTML = `<div class="act-row">（暂无任务）</div>`; return; }
-  for (const t of tasks) {
-    const el = document.createElement("div");
-    el.className = "task-item";
-    const steps = t.steps_used ? ` · ${t.steps_used}/${t.max_steps || "?"} 步` : "";
-    const acts = t.actions_used ? ` · ${t.actions_used} 动作` : "";
-    el.innerHTML = `<span>#${t.id} ${escapeHtml(t.title || "")}${steps}${acts}</span><span class="task-status ${t.status}">${taskStatusText(t.status)}</span>`;
-    el.onclick = () => openInspector(t.id);
-    page.appendChild(el);
-  }
-}
-function renderTaskList(tasks) {
-  for (const t of tasks) upsertTask(t.id, t);
-  refreshTasks();
-}
-
-/* ---------- 左栏（项目/会话树） ---------- */
+/* ---------- 右栏任务列表 ---------- *//* ---------- 左栏（项目/会话树） ---------- */
 function renderTree() {
   const tree = $("project-tree"); tree.innerHTML = "";
   for (const [pid, p] of Object.entries(state.projects)) {
@@ -823,11 +805,16 @@ function applyCurrentTitle() {
 function selectSession(sid) {
   state.current = sid; state.activity.delete(sid); state.liveTurn = null;
   state.tasks = {}; state.liveTaskProgress = {}; state.turnsById = {};
-  state.taskCards = {}; state.taskCardEls = {};
+  state.taskCards = {}; state.taskCardEls = {}; state.execLive = {};
+  setBusy(false);
   stream().innerHTML = ""; state.usage = null; state.context = null;
   $("ctx-badge").classList.add("hidden");
   renderUsageLine();
   renderTree(); renderFiles(); loadTimeline();
+  if (!$("tab-executor").classList.contains("hidden")) {   // 执行者页可见时跟随会话切换
+    refreshExecutor();
+    renderExecutorHeader();
+  }
 }
 
 /* ---------- 文件栏（单层显示 + 面包屑 + 返回上级） ---------- */
@@ -922,7 +909,20 @@ function confirmCard(ev) {
 }
 
 /* ---------- 输入与命令 ---------- */
-$("btn-send").onclick = sendInput;
+let mainBusy = false;
+function setBusy(on) {
+  mainBusy = on;
+  const btn = $("btn-send");
+  btn.classList.toggle("stop-mode", on);
+  btn.title = on ? "停止" : "发送";
+  btn.setAttribute("aria-label", on ? "停止" : "发送");
+  btn.querySelector(".icon-send").classList.toggle("hidden", on);
+  btn.querySelector(".icon-stop").classList.toggle("hidden", !on);
+}
+$("btn-send").onclick = () => {
+  if (mainBusy) { send({type: "stop", session: state.current}); return; }
+  sendInput();
+};
 $("input").addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendInput(); }
 });
@@ -932,8 +932,17 @@ function sendInput() {
   send({type: "user", session: state.current, text});
   userBubble(text); $("input").value = "";
 }
-$("btn-stop").onclick = () => send({type: "stop", session: state.current});
-$("plan-toggle").onchange = (e) => send({type: "set_plan_mode", on: e.target.checked});
+$("btn-plan-mode").onclick = (e) => {
+  e.stopPropagation();
+  closeMenus();
+  $("plan-menu").classList.toggle("hidden");
+};
+document.querySelectorAll("#plan-menu .menu-item").forEach((el) => {
+  el.onclick = () => {
+    closeMenus();
+    send({type: "set_plan_mode", on: el.dataset.plan === "on"});
+  };
+});
 
 /* ---------- 设置：服务商（凭据全局共享）+ 角色模型 + 高级 ---------- */
 
@@ -979,11 +988,19 @@ function renderProviders() {
     if (row.configured) {
       btn.textContent = "刷新";
       btn.onclick = () => send({type: "list_models", provider: row.providerId, refresh: true});
+      actions.appendChild(btn);
+      if (row.hasKey) {
+        const off = document.createElement("button");
+        off.textContent = "断开";
+        off.title = "删除该服务商凭据（换 key 后可重新连接）";
+        off.onclick = () => send({type: "disconnect_provider", provider_id: row.providerId});
+        actions.appendChild(off);
+      }
     } else {
       btn.textContent = "连接";
       btn.onclick = () => startConnectPreset(row);
+      actions.appendChild(btn);
     }
-    actions.appendChild(btn);
     el.append(name, stateEl, actions);
     box.appendChild(el);
   }
@@ -1039,18 +1056,7 @@ function fillEffortSelect(sel, role, st) {
   sel.innerHTML = "";
   sel.onchange = null;
   const stateInfo = effortState({reasoning_mode: st.reasoning_mode, levels: st.efforts});
-  if (!st.configured) {
-    const o = document.createElement("option");
-    o.value = ""; o.textContent = "未配置"; o.disabled = true; sel.appendChild(o);
-    return;
-  }
-  if (!stateInfo.selectable) {
-    const hints = {fixed: "固定", none: "无推理", unknown: "未知", "unknown-levels": "档位未知"};
-    const o = document.createElement("option");
-    o.value = ""; o.textContent = hints[stateInfo.mode] || "不可调"; o.disabled = true;
-    sel.appendChild(o);
-    return;
-  }
+  if (!stateInfo.selectable) return;  // 调用方已保证可调
   for (const level of stateInfo.levels) {
     const o = document.createElement("option");
     o.value = level; o.textContent = effortLabel(level);
@@ -1107,11 +1113,15 @@ function renderRoleSettings() {
       const [pid, model] = modelSel.value.split("|");
       if (pid && model) send({type: "set_model", role, provider_id: pid, model});
     };
-    const effortSel = document.createElement("select");
-    effortSel.className = "role-effort";
-    effortSel.title = `${role} 的思考强度`;
-    fillEffortSelect(effortSel, role, st);
-    row.append(name, modelSel, effortSel);
+    if (roleEffortVisible(st)) {
+      const effortSel = document.createElement("select");
+      effortSel.className = "role-effort";
+      effortSel.title = `${role} 的思考强度`;
+      fillEffortSelect(effortSel, role, st);
+      row.append(name, modelSel, effortSel);
+    } else {
+      row.append(name, modelSel);  // 能力未知/不可调：不给用户看“未知”控件
+    }
     box.appendChild(row);
   }
 }
@@ -1188,6 +1198,7 @@ function renderRingFromStatus(roles) {
   const exact = Boolean(state.context && state.context.exact);
   const window = (roles.main && roles.main.window) || null;
   const percent = window ? Math.round((used / window) * 100) : null;
+  $("ctx-ring-wrap").classList.toggle("hidden", !ringVisible(window));
   renderRing({ used_tokens: used, exact, window, percent });
 }
 
@@ -1196,6 +1207,7 @@ function renderProviderStatus() {
   renderModelButton(roles);
   renderEffortButton(roles.main);
   renderRingFromStatus(roles);  // 模型切换后窗口能力立即反映到环
+  renderExecutorHeader();
   if (!$("modal-mask").classList.contains("hidden")) {
     renderProviders();
     renderRoleSettings();
@@ -1204,7 +1216,7 @@ function renderProviderStatus() {
 }
 
 function closeMenus() {
-  for (const id of ["effort-menu"]) $(id).classList.add("hidden");
+  for (const id of ["effort-menu", "plan-menu"]) $(id).classList.add("hidden");
 }
 
 /* ---------- 模型选择器（真实 provider 列表） ---------- */
@@ -1320,37 +1332,42 @@ function closeModelModal() {
 
 function renderModelButton(roles) {
   const main = roles.main || {};
-  $("btn-model").textContent = `模型：${main.model || "未配置"} ▾`;
+  $("btn-model-label").textContent = main.configured
+    ? (modelDisplayName(main.provider_id, main.model) || main.model)
+    : "未配置";
   $("btn-model").title = main.configured
-    ? `当前模型：${main.model}（点击从 provider 列表选择）`
-    : "尚未配置 provider，点击进入设置";
+    ? `指挥者（主 agent）的模型：${main.model}（点击从 provider 列表选择）`
+    : "指挥者尚未配置 provider，点击进入设置";
+}
+
+function modelDisplayName(providerId, modelId) {
+  if (!modelId) return "";
+  for (const g of roleModelOptions(state.modelCatalog, state.providerStatus)) {
+    if (g.providerId !== providerId) continue;
+    for (const m of g.models) if (m.id === modelId) return m.name || m.id;
+  }
+  return modelId;
 }
 
 function renderEffortButton(mainStatus) {
-  const stateInfo = effortState(mainStatus && {
+  const wrap = $("btn-effort").closest(".menu-wrap");
+  if (!roleEffortVisible(mainStatus)) {
+    // 能力未知/不可调：不显示思考控件，也不暴露内部原因
+    wrap.classList.add("hidden");
+    $("effort-menu").classList.add("hidden");
+    $("effort-menu").innerHTML = "";
+    return;
+  }
+  wrap.classList.remove("hidden");
+  const stateInfo = effortState({
     reasoning_mode: mainStatus.reasoning_mode,
     levels: mainStatus.efforts,
   });
   const effort = (mainStatus && mainStatus.effort) || "off";
-  const label = stateInfo.mode === "adjustable"
-    ? effortLabel(effort)
-    : stateInfo.label;
-  $("btn-effort").textContent = `思考：${label} ▾`;
+  $("btn-effort-label").textContent = effortLabel(effort);
+  $("btn-effort").title = "指挥者（主 agent）的思考强度";
   const menu = $("effort-menu");
   menu.innerHTML = "";
-  if (!stateInfo.selectable) {
-    const hints = {
-      fixed: "该模型思考固定开启，不支持调节",
-      none: "该模型不支持推理",
-      unknown: "模型能力未知（provider 未返回能力信息）",
-      "unknown-levels": "档位未知（请在模型能力中声明）",
-    };
-    const item = document.createElement("button");
-    item.className = "menu-item dim"; item.disabled = true;
-    item.textContent = hints[stateInfo.mode] || "不可调节";
-    menu.appendChild(item);
-    return;
-  }
   for (const level of stateInfo.levels) {
     const item = document.createElement("button");
     item.className = "menu-item" + (level === effort ? " active" : "");
@@ -1467,7 +1484,300 @@ for (const tab of document.querySelectorAll(".tab")) {
     document.querySelectorAll(".tab").forEach(t => t.classList.remove("active"));
     tab.classList.add("active");
     $("tab-files").classList.toggle("hidden", tab.dataset.tab !== "files");
-    $("tab-tasks").classList.toggle("hidden", tab.dataset.tab !== "tasks");
-    if (tab.dataset.tab === "tasks") refreshTasks();
+    $("tab-executor").classList.toggle("hidden", tab.dataset.tab !== "executor");
+    if (tab.dataset.tab === "executor") { refreshExecutor(); renderExecutorHeader(); }
   };
 }
+
+/* ---------- 执行者会话面板（右栏）：完整历史 + 直连输入 ---------- */
+
+let execRefreshing = false;
+let execPending = false;
+
+function openExecutorTab() {
+  for (const tab of document.querySelectorAll(".tab")) {
+    tab.classList.toggle("active", tab.dataset.tab === "executor");
+  }
+  $("tab-files").classList.add("hidden");
+  $("tab-executor").classList.remove("hidden");
+  refreshExecutor();
+  renderExecutorHeader();
+  updateExecButton();
+}
+
+function updateExecButton() {
+  const busy = Object.values(state.tasks)
+    .some((t) => t && (t.status === "running" || t.status === "queued"));
+  state.execBusy = busy;
+  const btn = $("exec-send");
+  btn.classList.toggle("stop-mode", busy);
+  btn.title = busy ? "中断执行者当前任务" : "发送";
+  btn.setAttribute("aria-label", busy ? "中断执行者当前任务" : "发送");
+  btn.querySelector(".icon-send").classList.toggle("hidden", busy);
+  btn.querySelector(".icon-stop").classList.toggle("hidden", !busy);
+}
+
+function renderExecReport(on) {
+  state.execReport = !!on;
+  const btn = $("exec-report");
+  btn.textContent = `回报：${on ? "开" : "关"}`;
+  btn.classList.toggle("on", !!on);
+}
+
+function renderExecutorHeader() {
+  const st = state.providerStatus?.roles?.executor || {};
+  const modelSel = $("exec-model");
+  const groups = roleModelOptions(state.modelCatalog, state.providerStatus);
+  modelSel.innerHTML = "";
+  let found = false;
+  for (const g of groups) {
+    const og = document.createElement("optgroup");
+    og.label = g.provider;
+    for (const m of g.models) {
+      const o = document.createElement("option");
+      o.value = `${g.providerId}|${m.id}`;
+      o.textContent = m.name;
+      if (g.providerId === st.provider_id && m.id === st.model) { o.selected = true; found = true; }
+      og.appendChild(o);
+    }
+    modelSel.appendChild(og);
+  }
+  if (!found && st.model) {
+    const o = document.createElement("option");
+    o.value = `${st.provider_id}|${st.model}`;
+    o.textContent = st.model; o.selected = true;
+    modelSel.appendChild(o);
+  }
+  if (!groups.length) {
+    const o = document.createElement("option");
+    o.value = ""; o.textContent = "先连接服务商"; o.disabled = true;
+    modelSel.appendChild(o);
+  }
+  modelSel.disabled = !groups.length;
+  modelSel.onchange = () => {
+    const [pid, model] = modelSel.value.split("|");
+    if (pid && model) send({type: "set_model", role: "executor", provider_id: pid, model});
+  };
+  const effortSel = $("exec-effort");
+  if (roleEffortVisible(st)) {
+    effortSel.classList.remove("hidden");
+    fillEffortSelect(effortSel, "executor", st);
+  } else {
+    effortSel.classList.add("hidden");   // 能力未知/不可调：不显示，避免"未知"噪音
+    effortSel.innerHTML = "";
+  }
+}
+
+async function refreshExecutor() {
+  if (!state.current) return;
+  if (execRefreshing) { execPending = true; return; }
+  execRefreshing = true;
+  const sid = state.current;
+  try {
+    const data = await api(`/api/executor_messages?session=${encodeURIComponent(sid)}`);
+    if (state.current !== sid) return;   // 快速切换：丢弃过期响应
+    renderExecReport(data.report !== false);
+    renderExecutorMessages(data.messages || [], data.inflight || []);
+  } finally {
+    execRefreshing = false;
+    if (execPending) { execPending = false; refreshExecutor(); }  // 尾调用补偿
+  }
+}
+
+function maybeRefreshExecutor(session) {
+  if (session === state.current && !$("tab-executor").classList.contains("hidden")) {
+    refreshExecutor();
+  }
+}
+
+function renderExecutorMessages(messages, inflight) {
+  const box = $("exec-timeline");
+  const stick = shouldStickToBottom(box.scrollHeight, box.scrollTop, box.clientHeight);
+  const prevTop = box.scrollTop;
+  box.innerHTML = "";
+  if (!messages.length && !(inflight && inflight.length)) {
+    const empty = document.createElement("div");
+    empty.className = "exec-empty";
+    empty.textContent = "（执行者还没有任何任务）";
+    box.appendChild(empty);
+    updateExecButton();
+    return;
+  }
+  for (const raw of messages) {
+    const m = executorMessageView(raw);
+    if (m.isToolResult) {
+      const el = document.createElement("div");
+      el.className = "exec-msg-result";
+      el.textContent = `↳ 工具结果：${m.text.slice(0, 300)}`;
+      box.appendChild(el);
+      continue;
+    }
+    if (m.role === "user") {
+      const el = document.createElement("div");
+      el.className = "exec-msg-user";
+      el.textContent = m.text;
+      renderMath(el);
+      box.appendChild(el);
+      continue;
+    }
+    if (m.role !== "assistant") continue;
+    const el = document.createElement("div");
+    el.className = "exec-msg-assistant";
+    if (m.reasoning) {
+      const details = document.createElement("details");
+      details.className = "exec-msg-reasoning";
+      const sum = document.createElement("summary");
+      sum.textContent = "思考";
+      const pre = document.createElement("pre");
+      pre.textContent = m.reasoning;
+      details.append(sum, pre);
+      el.appendChild(details);
+    }
+    if (m.text) {
+      const text = document.createElement("div");
+      text.textContent = m.text;
+      el.appendChild(text);
+    }
+    for (const call of m.calls) {
+      const row = document.createElement("div");
+      row.className = "exec-msg-tool";
+      row.textContent = `🔧 ${call.name} ${JSON.stringify(call.arguments).slice(0, 120)}`;
+      el.appendChild(row);
+    }
+    renderMath(el);
+    box.appendChild(el);
+  }
+  renderExecutorInflight(inflight);
+  renderExecLiveBuffers(inflight);
+  if (stick) box.scrollTop = box.scrollHeight;
+  else box.scrollTop = prevTop;
+  updateExecButton();
+}
+
+function renderExecLiveBuffers(inflight) {
+  const box = $("exec-timeline");
+  const assistants = (inflight || [])
+    .map((raw) => executorMessageView(raw))
+    .filter((m) => m.role === "assistant").length;
+  for (const [tid, buf] of Object.entries(state.execLive)) {
+    if (!buf.text && !buf.reasoning) continue;
+    const steps = state.liveTaskProgress[tid]?.steps;
+    // 步数基线未知（如切会话后回包未到）时不退役：等事件驱动的清理，避免误清前缀
+    if (steps !== undefined && liveBufferStale(steps, assistants)) {
+      delete state.execLive[tid];   // 本轮已进入 inflight 快照：实时缓冲退役
+      continue;
+    }
+    const el = document.createElement("div");
+    el.id = `exec-live-${tid}`;
+    el.className = "exec-msg-assistant inflight live";
+    renderExecLive(el, buf);
+    box.appendChild(el);
+  }
+}
+
+function renderExecLive(el, buf) {
+  el.textContent = "";
+  if (buf.reasoning) {
+    const details = document.createElement("details");
+    details.className = "exec-msg-reasoning";
+    const sum = document.createElement("summary");
+    sum.textContent = "思考";
+    const pre = document.createElement("pre");
+    pre.textContent = buf.reasoning;
+    details.append(sum, pre);
+    el.appendChild(details);
+  }
+  const text = document.createElement("div");
+  text.className = "exec-live-text";
+  text.textContent = buf.text;
+  el.appendChild(text);
+}
+
+function execAppendLive(taskId, kind, text) {
+  if (taskId === undefined || taskId === null || !text) return;
+  const buf = state.execLive[taskId]
+    || (state.execLive[taskId] = {text: "", reasoning: ""});
+  buf[kind] += text;
+  if ($("tab-executor").classList.contains("hidden")) return;
+  const box = $("exec-timeline");
+  const stick = shouldStickToBottom(box.scrollHeight, box.scrollTop, box.clientHeight);
+  let el = document.getElementById(`exec-live-${taskId}`);
+  if (!el) {
+    el = document.createElement("div");
+    el.id = `exec-live-${taskId}`;
+    el.className = "exec-msg-assistant inflight live";
+    box.appendChild(el);
+  }
+  renderExecLive(el, buf);
+  if (stick) box.scrollTop = box.scrollHeight;
+}
+
+function clearExecLive(taskId) {
+  if (taskId === undefined || taskId === null) return;
+  delete state.execLive[taskId];
+  const el = document.getElementById(`exec-live-${taskId}`);
+  if (el) el.remove();
+}
+
+function renderExecutorInflight(inflight) {
+  // 进行中任务的消息：淡显（未持久化，任务结束后才进入正式历史）
+  const box = $("exec-timeline");
+  for (const raw of inflight || []) {
+    const el = document.createElement("div");
+    const m = executorMessageView(raw);
+    el.className = (m.role === "user" ? "exec-msg-user" : "exec-msg-assistant") + " inflight";
+    if (m.role === "user") {
+      el.textContent = m.text;
+      renderMath(el);
+      box.appendChild(el);
+      continue;
+    }
+    if (m.text) {
+      const text = document.createElement("div");
+      text.textContent = m.text;
+      el.appendChild(text);
+    }
+    for (const call of m.calls) {
+      const row = document.createElement("div");
+      row.className = "exec-msg-tool";
+      row.textContent = `🔧 ${call.name} ${JSON.stringify(call.arguments).slice(0, 120)}`;
+      el.appendChild(row);
+    }
+    renderMath(el);
+    if (el.childElementCount) box.appendChild(el);
+  }
+}
+
+$("exec-send").onclick = () => {
+  if (!state.current) return;
+  if (state.execBusy) {
+    send({type: "executor_stop", session: state.current});
+    flash("正在中断执行者任务…");
+    return;
+  }
+  const text = $("exec-input").value.trim();
+  if (!text) return;
+  send({type: "executor_message", session: state.current, text});
+  $("exec-input").value = "";
+};
+$("exec-report").onclick = () => {
+  if (!state.current) return;
+  send({type: "set_executor_report", session: state.current, on: !state.execReport});
+};
+$("exec-input").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey) {
+    e.preventDefault();
+    const text = $("exec-input").value.trim();
+    if (!text || !state.current) return;
+    send({type: "executor_message", session: state.current, text});
+    $("exec-input").value = "";
+  }
+});
+
+// 执行者相关事件 → 面板刷新（实时）
+const EXEC_EVENT_TYPES = new Set([
+  "subagent_queued", "subagent_started", "subagent_step", "subagent_text_delta",
+  "subagent_tool_started", "subagent_tool_finished", "subagent_completed", "subagent_failed",
+  "reasoning_delta",
+]);
+

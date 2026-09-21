@@ -168,3 +168,49 @@ async def test_make_tool_returns_task_id_text() -> None:
     assert "#1" in output
     await asyncio.sleep(0.05)
     assert events[-1].output == "ok"
+
+
+async def test_cancel_all_cancels_queued_waiting_for_lock() -> None:
+    """排队等 writer 锁的任务被取消也必须进 cancelled，不能永远卡在 queued。"""
+    gate = asyncio.Event()
+    events: list[SubtaskEvent] = []
+    locks: dict = {}
+
+    async def spawn(task_id: int, prompt: str, extra_tools: list) -> str:
+        await gate.wait()
+        return "x"
+
+    dispatcher = Dispatcher(spawn=spawn, on_event=events.append,
+                            writer_locks=locks, project_key="proj")
+    dispatcher.dispatch("a")
+    dispatcher.dispatch("b")
+    await asyncio.sleep(0.02)
+    assert dispatcher.tasks[1] == "running" and dispatcher.tasks[2] == "queued"
+
+    dispatcher.cancel_all()
+    await asyncio.sleep(0.05)
+
+    assert dispatcher.tasks[1] == "cancelled"
+    assert dispatcher.tasks[2] == "cancelled"          # 修复前永远卡 queued
+    assert [e.status for e in events if e.status == "cancelled"] == ["cancelled", "cancelled"]
+    assert not locks["proj"].locked()                   # 锁没泄漏
+    gate.set()
+
+
+async def test_cancel_reason_reported_in_event() -> None:
+    """中断来源必须原样写进 cancelled 事件（指挥者据此知道是谁停的）。"""
+    gate = asyncio.Event()
+    events: list[SubtaskEvent] = []
+
+    async def spawn(task_id: int, prompt: str, extra_tools: list) -> str:
+        await gate.wait()
+        return "x"
+
+    dispatcher = make_dispatcher(spawn, events)
+    dispatcher.dispatch("干活")
+    await asyncio.sleep(0.02)
+    dispatcher.cancel_all("用户手动中断（点击了指挥者栏的停止按钮）")
+    await asyncio.sleep(0.05)
+    cancelled = [e for e in events if e.status == "cancelled"]
+    assert cancelled and cancelled[0].output == "用户手动中断（点击了指挥者栏的停止按钮）"
+    assert dispatcher._cancel_reasons == {}

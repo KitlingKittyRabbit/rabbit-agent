@@ -142,3 +142,18 @@ def test_reasoning_returned_roundtrips_for_metadata_and_override(tmp_path):
     cached = provider["models"][0]["capability"]
     assert cached["reasoning_returned"] is False and cached["window"] == 1000
     assert provider["models_fetched_at"] == 123.5
+
+
+def test_save_registry_skips_empty_catalog(tmp_path):
+    """无目录名的 provider 不写 catalog 空字段（避免注册表噪音）。"""
+    registry = {
+        "roles": {"main": {"provider_id": "p-a", "model": "m", "reasoning_effort": "off"}},
+        "providers": {"p-a": {"name": "n", "protocol": "openai", "base_url": "http://x/v1",
+                              "model_overrides": {}, "models": [], "models_fetched_at": 0.0,
+                              "catalog": ""}},
+    }
+    save_registry(tmp_path / "p.toml", registry)
+    text = (tmp_path / "p.toml").read_text(encoding="utf-8")
+    assert "catalog" not in text
+    loaded = load_registry(tmp_path / "p.toml")
+    assert loaded["providers"]["p-a"]["catalog"] == ""
