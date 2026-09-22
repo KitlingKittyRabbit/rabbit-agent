@@ -6,10 +6,15 @@ import json
 import time
 from pathlib import Path
 
-_AUDIT_TOOLS = {"write_file", "edit_file", "run_shell"}
+from ..tools.base import scrub_secrets
+
+# 写操作与外部变更操作：gh_command / git_remote 会产生远端或本地变更，一并入审计
+_AUDIT_TOOLS = {"write_file", "edit_file", "run_shell", "gh_command", "git_remote"}
 
 
 def _truncate(text: str, limit: int = 300) -> str:
+    # 兜底清洗：即使某个工具漏洗，凭据也不落进审计文件
+    text = scrub_secrets(text)
     return text if len(text) <= limit else text[:limit] + "…"
 
 

@@ -20,7 +20,7 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 from ..providers import ToolSpec
-from .base import Tool
+from .base import Tool, cap_output
 
 _MAX_OUTPUT = 8192
 
@@ -55,6 +55,26 @@ def sandbox_mode() -> str:
     return "bwrap" if _BWRAP else "unsandboxed"
 
 
+def base_mount_args() -> list[str]:
+    """bwrap 通用挂载（argv 形式）：系统只读 + 临时 /tmp。
+
+    供 run_shell（拼成 shell 字符串）与宿主凭据代理（直接以 argv 启动）共用，
+    顺序不可调换：--ro-bind / / 必须在 --dev-bind /dev 之前，否则 /dev 被盖住。
+    """
+    return [
+        "--die-with-parent",
+        "--ro-bind", "/", "/",
+        "--dev-bind", "/dev", "/dev",
+        "--proc", "/proc",
+        "--tmpfs", "/tmp",
+    ]
+
+
+def root_bind_args(root: Path) -> list[str]:
+    """把项目根挂回可写。必须排在 --tmpfs /tmp 与其它遮蔽之后：更晚的挂载才生效。"""
+    return ["--bind", str(root), str(root)]
+
+
 def _sandbox_env() -> dict:
     return {k: v for k, v in os.environ.items() if k in _ENV_ALLOWLIST}
 
@@ -77,12 +97,13 @@ def _wrap_command(command: str, root: Path) -> str:
     if _BWRAP is None:
         return command
     quoted_root = shlex.quote(str(root))
+    mounts = " ".join(
+        shlex.quote(part) for part in (*base_mount_args(), *root_bind_args(root))
+    )
     # 不用 --new-session：沙箱内进程须留在我们的进程组，killpg 才能整组杀
     # mask 放在 root bind 之后：遮蔽必须最后生效（root bind 可能意外覆盖敏感路径）
     return (
-        f"{_BWRAP} --die-with-parent"
-        f" --ro-bind / / --dev-bind /dev /dev --proc /proc --tmpfs /tmp"
-        f" --bind {quoted_root} {quoted_root} {_mask_args()}"
+        f"{_BWRAP} {mounts} {_mask_args()}"
         f" --chdir {quoted_root}"
         f" sh -c {shlex.quote(command)}"
     )
@@ -125,10 +146,7 @@ def make_shell_tool(root: Path, confirm: Callable[[str], Awaitable[bool]] | None
                 await proc.wait()
             raise
         output = stdout.decode("utf-8", errors="replace")
-        if len(output) > _MAX_OUTPUT:
-            half = _MAX_OUTPUT // 2
-            output = output[:half] + "\n...（输出过长，中间截断）...\n" + output[-half:]
-        return f"exit code: {proc.returncode}\n{output}".rstrip()
+        return f"exit code: {proc.returncode}\n{cap_output(output, _MAX_OUTPUT)}".rstrip()
 
     return Tool(
         ToolSpec(

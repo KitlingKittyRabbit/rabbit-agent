@@ -2,12 +2,46 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 
 from ..providers import ToolSpec
 
 ToolHandler = Callable[[dict], Awaitable[str]]
+
+MAX_OUTPUT_CHARS = 30_000  # 工具输出统一上限（字符）：防止单次结果撑爆上下文
+
+# 凭据形态兜底：拿不到确切值（如子进程回显）时也能挡住常见 token/URL 内嵌凭据
+_SECRET_VALUE_SHAPES = re.compile(r"\b(?:gh[pousr]|github_pat)_[A-Za-z0-9_]{10,}")
+_SECRET_URL_SHAPES = re.compile(r"(\bhttps?://)[^/\s@]+:[^/\s@]+@")
+
+
+def scrub_secrets(text: str, *secrets: str) -> str:
+    """清洗意外出现的凭据：已知值精确替换 + token 形态/URL 内嵌凭据兜底。
+
+    工具结果、异常文本、审计记录都必须经此出口，保证凭据不进模型上下文与日志。
+    """
+    out = text or ""
+    for secret in secrets:
+        if secret and len(secret) >= 8:
+            out = out.replace(secret, "***")
+    out = _SECRET_VALUE_SHAPES.sub("***", out)
+    return _SECRET_URL_SHAPES.sub(r"\1***@", out)
+
+
+def cap_output(text: str, limit: int = MAX_OUTPUT_CHARS) -> str:
+    """统一输出预算：超限时保留头尾，中间以标记明示省略了多少字符。"""
+    if len(text) <= limit:
+        return text
+    head = limit // 2
+    tail = limit - head
+    omitted = len(text) - head - tail
+    return (
+        f"{text[:head]}\n"
+        f"……（输出过长，中间省略 {omitted} 字符；完整共 {len(text)} 字符）\n"
+        f"{text[-tail:]}"
+    )
 
 
 class ToolError(Exception):
@@ -55,6 +89,7 @@ class ToolRegistry:
             if self._on_call is not None:
                 self._on_call(name, arguments, "error", str(e))
             raise
+        result = cap_output(result)
         if self._on_call is not None:
             self._on_call(name, arguments, "finished", result)
         return result

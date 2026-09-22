@@ -78,7 +78,9 @@ class Conversation:
             start_id=start_id,
         )
         self._main_tools = build_registry(
-            self._root(), write=False, shell=False, on_call=self._audit_call
+            self._root(), write=False, shell=False, on_call=self._audit_call,
+            # 只读账号查询：主 agent 看得到已登录账号，但拿不到任何可写 GitHub/Git 能力
+            host_github="read",
         )
         self._main_tools.add(self._dispatcher.make_tool())
         self._main_tools.add(self._dispatcher.make_answer_tool())
