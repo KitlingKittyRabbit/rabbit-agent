@@ -628,6 +628,9 @@ class ProviderManager:
             provider._reasoning_effort = (
                 self._efforts[role] if capability.reasoning_mode == "adjustable" else None
             )
+            # 目录声明 interleaved 时补齐实例的回传字段；已有值（显式配置/自愈所得）不覆盖
+            if capability.interleaved and not getattr(provider, "_echo_reasoning_field", None):
+                provider._echo_reasoning_field = capability.interleaved
             if hasattr(provider, "reasoning_reserve"):
                 provider._thinking_budget = provider.reasoning_reserve(self._efforts[role])
 

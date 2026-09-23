@@ -2452,6 +2452,49 @@ async def test_activate_rebuild_passes_interleaved(tmp_path: Path) -> None:
     assert seen and seen[-1].get("echo_reasoning_field") == "reasoning_content"
 
 
+async def test_static_instance_reuse_fills_interleaved(tmp_path: Path) -> None:
+    """静态实例复用：目录能力必须补进已存在实例的 _echo_reasoning_field。"""
+    base = "https://api.example.com/v1"
+    fixture = {"thinking-api": {"api": base, "models": {"m": {
+        "reasoning": True, "interleaved": {"field": "reasoning_content"},
+        "limit": {"context": 1_000}}}}}
+    fake = FakeProvider([ChatResult(text="pong")])
+    orch = make_orchestrator(tmp_path, lambda **kw: fake)
+    orch.providers._catalog_data = {"providers": fixture}
+    pid = derive_provider_id("openai", base)
+    orch.providers._providers[pid] = {
+        "name": "x", "protocol": "openai", "base_url": base, "catalog": "",
+        "model_overrides": {}, "models": [], "error": None, "fetched_at": 0.0,
+    }
+    orch.providers._roles["main"] = {
+        "provider_id": pid, "model": "m", "reasoning_effort": "off"}
+    orch.providers._instances[("main", pid, "m")] = fake  # 已存在的静态实例
+    orch.providers._activate("main")
+    assert fake._echo_reasoning_field == "reasoning_content"
+
+
+async def test_static_instance_reuse_keeps_existing_echo_field(tmp_path: Path) -> None:
+    """已有非空回传字段不得被目录能力覆盖（显式配置/自愈所得优先）。"""
+    base = "https://api.example.com/v1"
+    fixture = {"thinking-api": {"api": base, "models": {"m": {
+        "reasoning": True, "interleaved": {"field": "reasoning_content"},
+        "limit": {"context": 1_000}}}}}
+    fake = FakeProvider([ChatResult(text="pong")])
+    fake._echo_reasoning_field = "reasoning_details"  # 已有值（显式配置或自愈所得）
+    orch = make_orchestrator(tmp_path, lambda **kw: fake)
+    orch.providers._catalog_data = {"providers": fixture}
+    pid = derive_provider_id("openai", base)
+    orch.providers._providers[pid] = {
+        "name": "x", "protocol": "openai", "base_url": base, "catalog": "",
+        "model_overrides": {}, "models": [], "error": None, "fetched_at": 0.0,
+    }
+    orch.providers._roles["main"] = {
+        "provider_id": pid, "model": "m", "reasoning_effort": "off"}
+    orch.providers._instances[("main", pid, "m")] = fake
+    orch.providers._activate("main")
+    assert fake._echo_reasoning_field == "reasoning_details"
+
+
 async def test_catalog_interleaved_reaches_provider_factory(tmp_path: Path) -> None:
     """目录声明 interleaved 的模型：字段名必须传到 provider（否则下一轮 400）。"""
     base = "https://api.example.com/v1"
