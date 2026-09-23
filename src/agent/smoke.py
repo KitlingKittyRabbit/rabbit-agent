@@ -7,7 +7,8 @@
 import asyncio
 
 from .core.config import ConfigError, make_provider
-from .core.provider_store import load_providers
+from .core.keystore import load_keys
+from .core.provider_store import load_registry
 from .providers import Message, ToolSpec
 
 STORE_PATH = ".providers.toml"
@@ -50,12 +51,23 @@ async def check_role(role: str, settings: dict, factory=make_provider) -> bool:
 
 
 async def _main() -> int:
-    stored = load_providers(STORE_PATH)
-    if not stored:
-        print(f"{STORE_PATH} 为空——先用 /connect_provider 连接服务商")
+    registry = load_registry(STORE_PATH)
+    keys = load_keys()
+    roles = registry.get("roles") or {}
+    if not roles:
+        print(f"{STORE_PATH} 无已绑定角色——先用 /connect_provider 连接服务商")
         return 1
     ok = True
-    for role, settings in stored.items():
+    for role, binding in roles.items():
+        provider_id = binding.get("provider_id") or ""
+        entry = (registry.get("providers") or {}).get(provider_id) or {}
+        settings = {
+            "protocol": entry.get("protocol") or "",
+            "base_url": entry.get("base_url"),
+            "model": binding.get("model") or "",
+            "api_key": keys.get(provider_id) or "",
+            "reasoning_effort": binding.get("reasoning_effort") or "off",
+        }
         ok = await check_role(role, settings) and ok
     return 0 if ok else 1
 

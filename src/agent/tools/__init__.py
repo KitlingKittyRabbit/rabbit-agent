@@ -13,7 +13,7 @@ def build_registry(
     *,
     write: bool,
     shell: bool,
-    on_call: Callable[[str, dict, str], None] | None = None,
+    on_call: Callable[[str, dict, str, str | None], None] | None = None,
     confirm: Callable[[str], Awaitable[bool]] | None = None,
 ) -> ToolRegistry:
     """按角色组装：write/shell 关闭时对应工具物理缺席（plan 模式与主 agent 的保障）。

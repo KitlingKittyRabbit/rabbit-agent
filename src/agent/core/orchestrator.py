@@ -10,13 +10,13 @@ from collections.abc import Callable
 from pathlib import Path
 from uuid import uuid4
 
-from ..providers import Message, Provider
+from ..providers import Provider
 from .audit import AuditLogger
 from .config import make_provider
 from .conversation import Conversation
 from .presets import PRESETS
 from .project_store import save_project
-from .provider_store import save_provider
+from .provider_manager import ProviderManager
 from .session import SessionStore
 
 
@@ -47,24 +47,20 @@ class Orchestrator:
         store: SessionStore | None = None,
         plan_mode: bool = False,
         max_steps_main: int = 50,
-        max_steps_executor: int = 30,
+        max_steps_executor: int = 100,
         store_path: str | Path | None = None,
+        keys_path: str | Path | None = None,
         provider_factory: Callable[..., Provider] = make_provider,
-        compact_threshold: int = 200_000,
+        catalog_fetcher: Callable[[], object] | None = None,
         audit_log_path: str | Path | None = None,
         projects: dict[str, dict] | None = None,
         projects_path: str | Path | None = None,
     ) -> None:
-        self.main_provider = main_provider
-        self.executor_provider = executor_provider
         self.root = Path(root)
         self.store = store
         self.plan_mode = plan_mode
         self.max_steps_main = max_steps_main
         self.max_steps_executor = max_steps_executor
-        self.compact_threshold = compact_threshold
-        self._store_path = Path(store_path) if store_path is not None else None
-        self._provider_factory = provider_factory
         self.audit = AuditLogger(audit_log_path)
 
         self.projects: dict[str, dict] = dict(projects) if projects else {}
@@ -73,10 +69,24 @@ class Orchestrator:
             self.projects["default"] = {"name": resolved.name, "path": str(resolved)}
         self._projects_path = Path(projects_path) if projects_path is not None else None
 
+        # provider 运行时实现已全部迁到 ProviderManager；以下接口保持兼容
+        self.providers = ProviderManager(
+            store_path=store_path, keys_path=keys_path,
+            provider_factory=provider_factory, catalog_fetcher=catalog_fetcher,
+            main_provider=main_provider, executor_provider=executor_provider,
+        )
         self._bus = _EventBus()
         self.conversations: dict[str, Conversation] = {}
+        self.writer_locks: dict[str, asyncio.Lock] = {}  # 项目 → writer 锁（writer 串行）
         self._started = False
         self._restore()
+
+    def __getattr__(self, name):
+        """provider 相关实现委托 ProviderManager；保持旧 API/测试兼容。"""
+        providers = self.__dict__.get("providers")
+        if providers is not None and hasattr(providers, name):
+            return getattr(providers, name)
+        raise AttributeError(name)
 
     def project_root(self, project_id: str) -> Path | None:
         entry = self.projects.get(project_id)
@@ -97,6 +107,8 @@ class Orchestrator:
         for s in stored:
             project_id = s.get("project_id") or default_project
             self._add_conversation(session_id=s["id"], project_id=project_id, title=s["title"])
+            if self.store is not None:
+                self.store.reconcile_stale_tasks(s["id"])
 
     def _add_conversation(self, *, session_id: str, project_id: str, title: str) -> Conversation:
         if self.project_root(project_id) is None:
@@ -235,11 +247,21 @@ class Orchestrator:
                 }
             )
         elif msg_type == "list_sessions":
+            created = (
+                {row["id"]: row["created_at"] for row in self.store.list_sessions()}
+                if self.store
+                else {}
+            )
             self.emit(
                 {
                     "type": "session_list",
                     "sessions": [
-                        {"id": c.id, "title": c.title, "project": c.project_id}
+                        {
+                            "id": c.id,
+                            "title": c.title,
+                            "project": c.project_id,
+                            "created_at": created.get(c.id),
+                        }
                         for c in self.conversations.values()
                     ],
                 }
@@ -257,6 +279,23 @@ class Orchestrator:
                         ],
                     }
                 )
+        elif msg_type == "executor_message":
+            conv = self.conversations.get(str(data.get("session") or ""))
+            text = str(data.get("text") or "").strip()
+            if conv is not None and text:
+                conv.executor_message(text)
+        elif msg_type == "executor_stop":
+            conv = self.conversations.get(str(data.get("session") or ""))
+            if conv is not None:
+                conv.executor_stop()
+        elif msg_type == "set_executor_report":
+            conv = self.conversations.get(str(data.get("session") or ""))
+            if conv is not None:
+                conv.set_executor_report(bool(data.get("on")))
+                self.emit({
+                    "type": "executor_report", "session": conv.id,
+                    "on": conv.executor_report(),
+                })
         elif msg_type == "stop":
             conv = self.conversations.get(str(data.get("session", "")))
             if conv is not None:
@@ -270,77 +309,156 @@ class Orchestrator:
                 conv.resolve_confirm(str(data.get("id", "")), allow)
         elif msg_type == "connect_provider":
             asyncio.get_running_loop().create_task(self._connect(data))
+        elif msg_type == "disconnect_provider":
+            asyncio.get_running_loop().create_task(self._disconnect(data))
+        elif msg_type == "get_provider_status":
+            self.emit(self.provider_status())
+        elif msg_type == "set_model":
+            asyncio.get_running_loop().create_task(self._set_model(data))
+        elif msg_type == "set_reasoning_effort":
+            asyncio.get_running_loop().create_task(self._set_effort(data))
+        elif msg_type == "list_models":
+            asyncio.get_running_loop().create_task(self._list_models(data))
+        elif msg_type == "set_model_capability":
+            provider_id = str(data.get("provider") or "")
+            model = str(data.get("model") or "")
+            override = data.get("override") if isinstance(data.get("override"), dict) else {}
+            self.emit(self.set_model_capability(provider_id, model, override))
+            self.emit(self.provider_status())
+            self.emit(self.model_catalog())
+        elif msg_type == "set_context_window":
+            role = str(data.get("role") or "")
+            window = data.get("window")
+            window = int(window) if isinstance(window, int) else None
+            self.emit(self.set_context_window(role, window))
+            self.emit(self.provider_status())
+
+    # ---------- provider 注册表（多 provider） ----------
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    # ---------- 上下文能力（窗口/思考强度/预算） ----------
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    async def _set_model(self, data: dict) -> None:
+        result = await self.set_model(
+            str(data.get("role") or ""),
+            str(data.get("provider_id") or ""),
+            str(data.get("model") or "").strip(),
+        )
+        self.emit(result)
+        self.emit(self.provider_status())
+        self.emit(self.model_catalog())
+
+    async def _set_effort(self, data: dict) -> None:
+        result = self.set_reasoning_effort(
+            str(data.get("role") or ""), str(data.get("effort") or "off")
+        )
+        self.emit(result)
+        self.emit(self.provider_status())
+
+    async def _list_models(self, data: dict) -> None:
+        provider_id = data.get("provider")
+        result = await self.list_models(
+            str(provider_id) if provider_id else None,
+            refresh=bool(data.get("refresh")),
+        )
+        self.emit(result)
+        self.emit(self.provider_status())
+
+
+
+
+
+    # ---------- provider 状态 ----------
+
+    def provider_status(self) -> dict:
+        """角色当前生效 provider/model/能力 + 全部已配置 provider 摘要（绝不含 api_key）。"""
+        return {
+            "type": "provider_status",
+            "roles": {
+                role: self._role_status(role)
+                for role in ("main", "executor")
+            },
+            "providers": [
+                {
+                    "id": pid,
+                    "name": entry["name"],
+                    "protocol": entry["protocol"],
+                    "base_url": entry["base_url"],
+                    "configured": self._provider_configured(pid),
+                    "has_key": self._provider_has_key(pid),
+                    "model_count": len(entry["models"]),
+                    "error": entry["error"],
+                }
+                for pid, entry in self._providers.items()
+            ],
+            "presets": self._presets_status(),
+            "max_steps": {"main": self.max_steps_main, "executor": self.max_steps_executor},
+            "plan_mode": self.plan_mode,
+        }
+
+
 
     # ---------- provider 连接 ----------
 
+    async def _disconnect(self, data: dict) -> None:
+        result = self.disconnect_provider(str(data.get("provider_id") or ""))
+        self.emit(result)
+        self.emit(self.provider_status())
+        self.emit(self.model_catalog())
+
     async def _connect(self, data: dict) -> None:
+        """页面/WS 连接入口：密钥需求判断统一由 connect_provider 负责，这里不改写 key。"""
         preset_name = str(data.get("preset") or "")
         preset = PRESETS.get(preset_name) if preset_name else None
         protocol = str(data.get("protocol") or (preset["protocol"] if preset else ""))
         base_url = data.get("base_url") or (preset["base_url"] if preset else None)
-        model = str(data.get("model") or (preset["model"] if preset else ""))
-        api_key = str(data.get("api_key") or "")
-        if preset and not preset["needs_key"] and not api_key:
-            api_key = "unused"
+        model = str(data.get("model") or "")  # 留空 = 连上后自动选默认模型
+        api_key = str(data.get("api_key") or "")  # 原样交给 connect_provider 判断
+        effort = str(data.get("reasoning_effort") or "off")
         result = await self.connect_provider(
             str(data.get("role", "")),
             protocol=protocol,
             base_url=base_url,
             model=model,
             api_key=api_key,
+            preset=preset_name,
+            reasoning_effort=effort,
         )
         self.emit(result)
+        self.emit(self.provider_status())  # 成功失败都刷新界面状态
+        self.emit(self.model_catalog())    # 目录/角色模型下拉同步刷新
 
-    async def connect_provider(
-        self,
-        role: str,
-        *,
-        protocol: str,
-        base_url: str | None,
-        model: str,
-        api_key: str,
-    ) -> dict:
-        """验证连接成功后才持久化并热切换；失败不保存、原样报错。"""
-        if role not in ("main", "executor"):
-            return {
-                "type": "provider_result",
-                "role": role,
-                "ok": False,
-                "message": f"未知角色: {role}（可选: main / executor）",
-            }
-        try:
-            candidate = self._provider_factory(
-                protocol=protocol, base_url=base_url, model=model, api_key=api_key
-            )
-        except Exception as e:
-            return {
-                "type": "provider_result",
-                "role": role,
-                "ok": False,
-                "message": f"配置无效（未保存）: {e}",
-            }
-        try:
-            await candidate.chat([Message(role="user", content="ping")])
-        except Exception as e:
-            return {
-                "type": "provider_result",
-                "role": role,
-                "ok": False,
-                "message": f"连接失败（未保存）: {type(e).__name__}: {e}",
-            }
-        if self._store_path is not None:
-            save_provider(
-                self._store_path,
-                role,
-                {"protocol": protocol, "base_url": base_url, "model": model, "api_key": api_key},
-            )
-        if role == "main":
-            self.main_provider = candidate
-        else:
-            self.executor_provider = candidate
-        return {
-            "type": "provider_result",
-            "role": role,
-            "ok": True,
-            "message": "连接成功，已切换并保存",
-        }
+
+
+
+
+
+

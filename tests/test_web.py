@@ -14,6 +14,9 @@ from agent.server.app import create_app
 def make_orch(
     tmp_path: Path, main=None, executor=None, projects=None, store=None, **kwargs
 ) -> Orchestrator:
+    # 显式隔离 store/keys：绝不触碰真实 ~/.rabbit-agent/keys.json
+    kwargs.setdefault("store_path", tmp_path / ".providers.toml")
+    kwargs.setdefault("keys_path", tmp_path / "keys.json")
     return Orchestrator(
         main_provider=main or FakeProvider([ChatResult(text="x")]),
         executor_provider=executor or FakeProvider([ChatResult(text="y")]),
@@ -31,6 +34,8 @@ def two_projects(tmp_path: Path) -> dict:
     pb.mkdir()
     (pa / "a.txt").write_text("A 项目文件", encoding="utf-8")
     (pb / "b.txt").write_text("B 项目文件", encoding="utf-8")
+    (pa / "sub").mkdir()
+    (pa / "sub" / "inner.txt").write_text("内层文件", encoding="utf-8")
     return {
         "pa": {"name": "A", "path": str(pa)},
         "pb": {"name": "B", "path": str(pb)},
@@ -140,6 +145,7 @@ async def test_create_project_bad_path(tmp_path: Path) -> None:
 
 
 async def test_subtask_step_events_flow(tmp_path: Path) -> None:
+    """执行事件流：subagent 的 queued/started/tool_started/tool_finished/completed。"""
     main = FakeProvider(
         [
             ChatResult(
@@ -169,28 +175,26 @@ async def test_subtask_step_events_flow(tmp_path: Path) -> None:
     try:
         session = next(iter(orch.conversations))
         orch.handle_client_message({"type": "user", "session": session, "text": "开始"})
-        steps = []
+        event_types = []
 
         async def collect() -> None:
             turn_ends = 0
             while turn_ends < 2:
                 event = await queue.get()
-                if event.get("type") == "subtask_step":
-                    steps.append(event)
-                elif event.get("type") == "turn_end":
+                if event["type"] != "turn_end":
+                    event_types.append(event["type"])
+                else:
                     turn_ends += 1
 
         await asyncio.wait_for(collect(), timeout=5)
     finally:
         await orch.stop()
 
-    kinds = [s["kind"] for s in steps]
-    assert "tool_call" in kinds
-    assert "tool_result" in kinds
-    assert "text" in kinds
-    assert all(s["task"] == 1 for s in steps)
-    tool_call_step = next(s for s in steps if s["kind"] == "tool_call")
-    assert "write_file" in tool_call_step["content"]
+    assert "subagent_queued" in event_types
+    assert "subagent_started" in event_types
+    assert "subagent_tool_started" in event_types
+    assert "subagent_tool_finished" in event_types
+    assert "subagent_completed" in event_types
 
 
 async def test_list_tasks(tmp_path: Path) -> None:
@@ -254,6 +258,173 @@ def test_http_api_and_page(tmp_path: Path) -> None:
         # marked 静态资源
         resp = client.get("/marked.min.js")
         assert resp.status_code == 200
+        # 时间线纯逻辑模块（ES module，浏览器端 app.js import）
+        resp = client.get("/timeline_logic.mjs")
+        assert resp.status_code == 200
+        assert "export function hasWork" in resp.text
+        assert "text/javascript" in resp.headers["content-type"]
+
+
+def test_ls_single_level_and_errors(tmp_path: Path) -> None:
+    """文件栏后端：子目录只返回本层；坏路径/缺文件给出错误。"""
+    projects = two_projects(tmp_path)
+    orch = make_orch(tmp_path, projects=projects)
+    with TestClient(create_app(orch)) as client:
+        sub = client.get("/api/ls", params={"project": "pa", "path": "sub"})
+        assert sub.status_code == 200
+        assert "inner.txt" in sub.json()["result"]
+        assert "a.txt" not in sub.json()["result"]  # 不再混入父层内容
+
+        bad_dir = client.get("/api/ls", params={"project": "pa", "path": "sub/nope"})
+        assert bad_dir.status_code == 400
+        assert "error" in bad_dir.json()
+
+        bad_file = client.get("/api/read", params={"project": "pa", "path": "sub/nope.txt"})
+        assert bad_file.status_code == 400
+        assert "error" in bad_file.json()
+
+
+# ---------- 历史 API（timeline/task） ----------
+
+
+def test_timeline_and_task_api(tmp_path: Path) -> None:
+    from agent.core.events import SUBAGENT_COMPLETED, TOOL_STARTED
+
+    store = SessionStore(tmp_path / "s.db")
+    store.create_session("s1", "default", "会话")
+    turn = store.create_turn("s1", "写文件", "running")
+    store.add_event(
+        "s1", TOOL_STARTED, 1.0, turn_id=turn, actor="main",
+        name="call_subagent", arguments="{}",
+    )
+    store.finish_turn(turn, "completed", "完成")
+    store.create_task(1, "s1", turn, "任务一", "prompt", "mock", "Fake", "done")
+    store.add_event(
+        "s1", SUBAGENT_COMPLETED, 2.0, turn_id=turn, task_id=1,
+        actor="subagent", text="ok",
+    )
+
+    with TestClient(create_app(make_orch(tmp_path, store=store))) as client:
+        resp = client.get("/api/timeline", params={"session": "s1"})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data["turns"]) == 1
+        assert data["turns"][0]["final_text"] == "完成"
+        assert [e["type"] for e in data["turns"][0]["events"]] == [TOOL_STARTED, SUBAGENT_COMPLETED]
+        assert data["tasks"][0]["title"] == "任务一"
+
+        resp = client.get("/api/task", params={"session": "s1", "task": 1})
+        assert resp.status_code == 200
+        detail = resp.json()
+        assert detail["task"]["status"] == "done"
+        assert detail["events"][0]["type"] == SUBAGENT_COMPLETED
+
+        assert client.get("/api/task", params={"session": "s1", "task": 99}).status_code == 404
+
+
+def test_timeline_and_task_without_store(tmp_path: Path) -> None:
+    with TestClient(create_app(make_orch(tmp_path))) as client:
+        resp = client.get("/api/timeline", params={"session": "s1"})
+        assert resp.json() == {"turns": [], "tasks": [], "context": None}
+        assert client.get("/api/task", params={"session": "s1", "task": 1}).status_code == 404
+
+
+def test_timeline_context_differs_old_vs_new(tmp_path: Path) -> None:
+    """切换/加载即返回上下文环数据（含 system）：旧会话明显大于新会话，未知模型不编造百分比。"""
+    from agent.providers import ChatResult, FakeProvider, Message
+
+    store = SessionStore(tmp_path / "s.db")
+    store.create_session("old", "default", "旧会话")
+    store.create_session("fresh", "default", "新会话")
+    store.replace("old", [Message(role="user", content="长" * 4000)])
+    store.replace("fresh", [])
+    store.close()
+
+    main = FakeProvider([ChatResult(text="x")])
+    orch = make_orch(tmp_path, main=main, store=SessionStore(tmp_path / "s.db"))
+    orch.set_context_window("main", 100_000)  # 用户显式覆盖（无 provider 元数据）
+    with TestClient(create_app(orch)) as client:
+        old = client.get("/api/timeline", params={"session": "old"}).json()["context"]
+        fresh = client.get("/api/timeline", params={"session": "fresh"}).json()["context"]
+        assert old["window"] == 100_000 and old["window_source"] == "user"
+        assert old["messages"] == 1
+        assert old["used_tokens"] > fresh["used_tokens"]  # system 也计入新会话
+        assert fresh["used_tokens"] > 0
+        assert old["percent"] == round(old["used_tokens"] / 100_000 * 100)
+        assert old["exact"] is False  # 历史未经过本次请求 → 估算
+        assert old["compact_at"] and old["compact_at"] < 100_000
+
+
+def test_timeline_context_unknown_model(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path / "s.db")
+    store.create_session("s1", "default", "会话")
+    store.close()
+    orch = make_orch(tmp_path, store=SessionStore(tmp_path / "s.db"))
+    with TestClient(create_app(orch)) as client:
+        context = client.get("/api/timeline", params={"session": "s1"}).json()["context"]
+        assert context["window"] is None
+        assert context["window_source"] == "unknown"
+        assert context["percent"] is None  # 不编造百分比
+
+
+async def test_session_list_includes_created_at(tmp_path: Path) -> None:
+    orch = make_orch(tmp_path, store=SessionStore(tmp_path / "s.db"))
+    queue = orch.subscribe()
+    orch.handle_client_message({"type": "list_sessions"})
+    event = await _until(queue, lambda e: e.get("type") == "session_list")
+    assert event["sessions"]
+    assert all("created_at" in s and s["created_at"] for s in event["sessions"])
+
+
+async def test_completed_turn_persisted(tmp_path: Path) -> None:
+    """跑完一轮后 turns/events 必须落库（UI 历史的数据源）。"""
+    from agent.core.events import FINAL_TEXT_DELTA, TURN_STARTED
+
+    db = tmp_path / "s.db"
+    orch = make_orch(tmp_path, store=SessionStore(db))
+    await orch.start()
+    try:
+        session = next(iter(orch.conversations))
+        orch.handle_client_message({"type": "user", "session": session, "text": "你好"})
+        await asyncio.sleep(0.3)
+    finally:
+        await orch.stop()
+
+    store = SessionStore(db)
+    turns = store.list_turns(session)
+    assert len(turns) == 1
+    assert turns[0]["user_message"] == "你好"
+    assert turns[0]["status"] == "completed"
+    assert turns[0]["final_text"] == "x"
+    event_types = [e["type"] for e in store.list_events(session)]
+    assert TURN_STARTED in event_types
+    assert FINAL_TEXT_DELTA in event_types
+    store.close()
+
+
+async def test_cancelled_turn_persisted(tmp_path: Path) -> None:
+    class BlockingProvider:
+        async def chat(self, messages, tools=None, on_text=None):
+            await asyncio.Event().wait()
+            return ChatResult(text="不应到达")
+
+    db = tmp_path / "s.db"
+    orch = make_orch(tmp_path, main=BlockingProvider(), store=SessionStore(db))
+    await orch.start()
+    try:
+        session = next(iter(orch.conversations))
+        orch.handle_client_message({"type": "user", "session": session, "text": "跑"})
+        await asyncio.sleep(0.1)
+        orch.handle_client_message({"type": "stop", "session": session})
+        await asyncio.sleep(0.3)
+    finally:
+        await orch.stop()
+
+    store = SessionStore(db)
+    turns = store.list_turns(session)
+    assert len(turns) == 1
+    assert turns[0]["status"] == "cancelled"
+    store.close()
 
 
 # ---------- 预设解析 ----------
@@ -281,7 +452,7 @@ async def test_connect_with_preset_resolution(tmp_path: Path) -> None:
     assert result["ok"] is True
     assert received["protocol"] == "openai"
     assert received["base_url"] == "https://api.deepseek.com/v1"
-    assert received["model"] == "deepseek-chat"  # 空模型回落预设默认
+    assert received["model"] == "deepseek-flash"  # 空模型回落预设默认
 
 
 async def test_connect_with_preset_no_key_needed(tmp_path: Path) -> None:
@@ -356,3 +527,17 @@ def test_migrate_drops_sessions_without_project_id(tmp_path: Path) -> None:
     store.create_session("new", "p1", "新")
     assert store.list_sessions()[0]["id"] == "new"
     store.close()
+
+
+async def test_timeline_loose_events_include_user_to_executor(tmp_path: Path) -> None:
+    """无 turn 的会话：直连执行者的灰色提示进入 timeline 的 loose_events（刷新可见）。"""
+    store = SessionStore(tmp_path / "s.db")
+    orch = make_orch(tmp_path, store=store)
+    conv = next(iter(orch.conversations.values()))
+    conv.executor_message("你好执行者")
+    with TestClient(create_app(orch)) as client:
+        resp = client.get(f"/api/timeline?session={conv.id}")
+        data = resp.json()
+    loose = [e for e in data.get("loose_events", []) if e["type"] == "user_to_executor"]
+    assert loose and loose[0]["turn_id"] is None
+    assert "你好执行者" in loose[0]["text"]

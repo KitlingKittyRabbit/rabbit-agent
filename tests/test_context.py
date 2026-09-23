@@ -1,11 +1,23 @@
 """上下文管理纯函数测试：估算、截断（含工具链对齐）、摘要序列化。"""
 
-from agent.core.context import estimate_chars, serialize_for_summary, truncate_messages
+from agent.core.context import (
+    approximate_tokens,
+    estimate_chars,
+    serialize_for_summary,
+    truncate_messages,
+)
 from agent.providers import Message, ToolCall
 
 
 def make_messages(count: int) -> list[Message]:
     return [Message(role="user", content=f"消息{i}") for i in range(count)]
+
+
+def test_approximate_tokens_is_chars_over_four() -> None:
+    assert approximate_tokens(0) == 0
+    assert approximate_tokens(3) == 0
+    assert approximate_tokens(4) == 1
+    assert approximate_tokens(1_000_000) == 250_000
 
 
 def test_estimate_counts_content_and_tool_args() -> None:

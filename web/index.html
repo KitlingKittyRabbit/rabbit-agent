@@ -3,118 +3,10 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>agent</title>
-<style>
-  :root {
-    --bg: #141210; --panel: #1C1917; --card: #26221F;
-    --text: #E7E5E4; --text-dim: #A8A29E; --accent: #E8930C;
-    --border: #292524; --danger: #DC6B5E;
-  }
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  html, body { height: 100%; }
-  body {
-    background: var(--bg); color: var(--text);
-    font: 14px/1.6 system-ui, -apple-system, "PingFang SC", sans-serif;
-    overflow: hidden;
-  }
-  #app { display: grid; grid-template-columns: var(--left-w, 240px) 5px 1fr 5px var(--right-w, 320px); height: 100vh; }
-  #left { grid-column: 1; }
-  #div-left { grid-column: 2; }
-  #center { grid-column: 3; }
-  #div-right { grid-column: 4; }
-  #right { grid-column: 5; }
-  .divider { background: var(--border); cursor: col-resize; }
-  .divider:hover { background: var(--accent); }
-  button {
-    background: var(--card); color: var(--text); border: 1px solid var(--border);
-    border-radius: 8px; padding: 4px 12px; cursor: pointer; font-size: 13px;
-  }
-  button:hover { border-color: var(--accent); }
-  button.primary { background: var(--accent); border-color: var(--accent); color: #1C1917; font-weight: 600; }
-  button:disabled { opacity: .45; cursor: default; }
-  input, select, textarea {
-    background: var(--card); color: var(--text); border: 1px solid var(--border);
-    border-radius: 8px; padding: 6px 10px; font: inherit; outline: none; width: 100%;
-  }
-  input:focus, textarea:focus, select:focus { border-color: var(--accent); }
-  code, pre, .mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
-  pre { background: #100E0D; border-radius: 8px; padding: 10px; overflow-x: auto; font-size: 12.5px; }
-  ::-webkit-scrollbar { width: 8px; height: 8px; }
-  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
-
-  /* 左栏 */
-  #left { background: var(--panel); border-right: 1px solid var(--border); overflow-y: auto; padding: 12px 8px; }
-  .pane-title { color: var(--text-dim); font-size: 12px; letter-spacing: .08em; padding: 0 8px 8px; display: flex; justify-content: space-between; align-items: center; }
-  .project-name { color: var(--text-dim); font-size: 13px; padding: 8px 8px 2px; display: flex; justify-content: space-between; align-items: center; }
-  .project-name .add-session { visibility: hidden; padding: 0 6px; font-size: 14px; }
-  .project-name:hover .add-session { visibility: visible; }
-  .session-item { padding: 5px 8px 5px 20px; border-radius: 8px; cursor: pointer; display: flex; align-items: center; gap: 6px; color: var(--text-dim); font-size: 13.5px; }
-  .session-item:hover { background: var(--card); }
-  .session-item.active { background: var(--card); color: var(--text); }
-  .session-item .label { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .session-item .actions { visibility: hidden; display: flex; gap: 2px; }
-  .session-item:hover .actions { visibility: visible; }
-  .session-item .actions button { padding: 0 4px; font-size: 12px; border: none; background: transparent; }
-  .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); visibility: hidden; flex: none; }
-  .session-item.has-activity .dot { visibility: visible; }
-
-  /* 中栏 */
-  #center { display: flex; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden; }
-  #chat-header { display: flex; align-items: center; gap: 12px; padding: 10px 16px; border-bottom: 1px solid var(--border); }
-  #current-title { font-weight: 600; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  #chat-header label { color: var(--text-dim); font-size: 13px; display: flex; gap: 4px; align-items: center; }
-  #stream { flex: 1; min-height: 0; overflow-y: auto; padding: 16px 20px; display: flex; flex-direction: column; gap: 12px; }
-  .msg-user { align-self: flex-end; background: var(--card); border-radius: 10px; padding: 8px 14px; max-width: 75%; white-space: pre-wrap; }
-  .msg-agent { align-self: flex-start; max-width: 85%; }
-  .msg-agent p { margin: 4px 0; }
-  .msg-note { align-self: center; color: var(--text-dim); font-size: 12px; }
-  .card { align-self: stretch; background: var(--card); border-left: 2px solid var(--accent); border-radius: 8px; padding: 10px 14px; font-size: 13px; }
-  .card .card-title { color: var(--accent); font-size: 12px; margin-bottom: 4px; }
-  .card pre { margin-top: 6px; }
-  .card .card-buttons { margin-top: 8px; display: flex; gap: 8px; }
-  .card.error-card { border-left-color: var(--danger); }
-  .card.error-card .card-title { color: var(--danger); }
-  #statusbar { display: flex; gap: 16px; padding: 4px 20px; color: var(--text-dim); font-size: 12px; border-top: 1px solid var(--border); }
-  #composer { display: flex; gap: 8px; padding: 12px 20px 16px; border-top: 1px solid var(--border); }
-  #input { flex: 1; resize: none; }
-  .composer-buttons { display: flex; flex-direction: column; gap: 6px; }
-
-  /* 右栏 */
-  #right { background: var(--panel); border-left: 1px solid var(--border); display: flex; flex-direction: column; }
-  .tabs { display: flex; border-bottom: 1px solid var(--border); }
-  .tab { flex: 1; border: none; border-radius: 0; background: transparent; color: var(--text-dim); padding: 8px; }
-  .tab.active { color: var(--text); box-shadow: inset 0 -2px 0 var(--accent); }
-  .tab-page { flex: 1; min-height: 0; overflow-y: auto; padding: 8px; font-size: 13px; }
-  .hidden { display: none !important; }
-  .tree-item { padding: 2px 8px; border-radius: 6px; cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--text-dim); }
-  .tree-item:hover { background: var(--card); color: var(--text); }
-  .tree-item.dir { color: var(--text); }
-  .file-view { display: flex; flex-direction: column; height: 100%; }
-  .file-view .file-path { color: var(--accent); font-size: 12px; padding: 4px 8px; display: flex; justify-content: space-between; }
-  .file-view pre { flex: 1; overflow: auto; margin: 4px; }
-  .task-item { padding: 6px 10px; border-radius: 8px; cursor: pointer; display: flex; justify-content: space-between; color: var(--text-dim); }
-  .task-item:hover, .task-item.active { background: var(--card); color: var(--text); }
-  .task-status { font-size: 12px; }
-  .task-status.running { color: var(--accent); }
-  .task-status.done { color: #7BAE7F; }
-  .task-status.error, .task-status.cancelled { color: var(--danger); }
-  .steps { padding: 4px; font-size: 12.5px; }
-  .step { padding: 4px 8px; border-radius: 6px; margin-bottom: 4px; background: var(--card); word-break: break-all; white-space: pre-wrap; }
-  .step-kind { color: var(--accent); font-size: 11px; display: block; }
-
-  /* 弹窗 */
-  #modal-mask, #modal2-mask { position: fixed; inset: 0; background: rgba(0,0,0,.55); display: flex; align-items: center; justify-content: center; z-index: 10; }
-  #modal, #modal2 { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 20px; width: 360px; display: flex; flex-direction: column; gap: 10px; }
-  #modal h3, #modal2 h3 { font-size: 15px; }
-  #modal label, #modal2 label { color: var(--text-dim); font-size: 12.5px; display: flex; flex-direction: column; gap: 4px; }
-  .modal-buttons { display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px; }
-  #m-result, #m2-result { font-size: 12.5px; min-height: 18px; }
-  #dir-browser { border: 1px solid var(--border); border-radius: 8px; max-height: 200px; overflow-y: auto; }
-  #dir-current { color: var(--accent); font-size: 12px; padding: 6px 10px; border-bottom: 1px solid var(--border); word-break: break-all; }
-  .dir-item { padding: 4px 10px; border-radius: 6px; cursor: pointer; color: var(--text-dim); font-size: 13px; }
-  .dir-item:hover { background: var(--card); color: var(--text); }
-  .dir-item.parent { color: var(--text); }
-</style>
+<title>rabbit-agent</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/styles.css">
+<link rel="stylesheet" href="/katex/katex.min.css">
 </head>
 <body>
 <div id="app">
@@ -127,40 +19,177 @@
     <header id="chat-header">
       <button id="collapse-left" title="收起/展开左栏">⟨</button>
       <span id="current-title">agent</span>
-      <label><input type="checkbox" id="plan-toggle"> plan</label>
-      <button id="btn-provider">连接</button>
+      <span id="turn-status"></span>
+      <span class="spacer"></span>
+      <button id="btn-settings" title="设置">⚙</button>
       <button id="collapse-right" title="收起/展开右栏">⟩</button>
     </header>
     <div id="stream"></div>
-    <div id="statusbar"><span id="tokens"></span><span id="ctx"></span><span id="flash"></span></div>
     <div id="composer">
-      <textarea id="input" rows="3" placeholder="说点什么…（Enter 发送，Shift+Enter 换行）"></textarea>
-      <div class="composer-buttons">
-        <button id="btn-send" class="primary">发送</button>
-        <button id="btn-stop">停止</button>
+      <div id="composer-box">
+        <textarea id="input" rows="2" placeholder="随便问点什么…（Enter 发送，Shift+Enter 换行）"></textarea>
+        <div class="composer-controls">
+          <div class="menu-wrap">
+            <button id="btn-plan-mode" class="text-select" title="plan 模式">
+              <span id="plan-label">Build</span><span class="caret" aria-hidden="true"></span>
+            </button>
+            <div id="plan-menu" class="menu hidden">
+              <button class="menu-item" data-plan="off">Build · 直接执行</button>
+              <button class="menu-item" data-plan="on">Plan · 只读规划</button>
+            </div>
+          </div>
+          <div class="menu-wrap">
+            <button id="btn-model" class="text-select" title="当前模型">
+              <span class="provider-glyph" aria-hidden="true"></span>
+              <span id="btn-model-label">未配置</span><span class="caret" aria-hidden="true"></span>
+            </button>
+          </div>
+          <div class="menu-wrap hidden">
+            <button id="btn-effort" class="text-select" title="思考强度">
+              <span id="btn-effort-label">未知</span><span class="caret" aria-hidden="true"></span>
+            </button>
+            <div id="effort-menu" class="menu hidden"></div>
+          </div>
+          <div id="ctx-ring-wrap" class="hidden" title="上下文占用">
+            <svg id="ctx-ring" viewBox="0 0 36 36" width="26" height="26" aria-hidden="true">
+              <circle class="ring-bg" cx="18" cy="18" r="15.9"></circle>
+              <circle id="ring-fg" class="ring-fg" cx="18" cy="18" r="15.9"></circle>
+            </svg>
+            <span id="ctx-ring-text">?</span>
+            <span id="ctx-badge" class="hidden">已压缩</span>
+          </div>
+          <span class="spacer"></span>
+          <button id="btn-send" class="round-send" title="发送" aria-label="发送">
+            <svg class="icon-send" viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 12.6V3.6M4.1 7.4 8 3.5l3.9 3.9"/></svg>
+            <svg class="icon-stop hidden" viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><rect x="4.4" y="4.4" width="7.2" height="7.2" rx="1.6" fill="currentColor"/></svg>
+          </button>
+        </div>
       </div>
     </div>
   </main>
   <div class="divider" id="div-right"></div>
   <aside id="right">
     <div class="tabs">
-      <button class="tab active" data-tab="files">文件</button>
-      <button class="tab" data-tab="tasks">任务</button>
+      <button class="tab active" data-tab="files">
+        <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 4.5A1.5 1.5 0 0 1 3.5 3h3l1.5 2h4.5A1.5 1.5 0 0 1 14 6.5v6A1.5 1.5 0 0 1 12.5 14h-9A1.5 1.5 0 0 1 2 12.5z"/></svg>
+        文件
+      </button>
+      <button class="tab" data-tab="executor">
+        <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="3" width="12" height="9" rx="2.5"/><path d="M5.5 14h5M8 12.2V14"/></svg>
+        执行者
+      </button>
     </div>
     <div id="tab-files" class="tab-page"></div>
-    <div id="tab-tasks" class="tab-page hidden"></div>
+    <div id="tab-executor" class="tab-page hidden">
+      <div id="exec-header">
+        <span class="exec-label">执行者</span>
+        <select id="exec-model" title="执行者使用的模型"></select>
+        <select id="exec-effort" title="执行者的思考强度"></select>
+        <button id="exec-report" class="text-select" title="执行者结果是否回报给指挥者">回报：开</button>
+      </div>
+      <div id="exec-timeline"></div>
+      <div id="exec-composer">
+        <div id="exec-box">
+          <textarea id="exec-input" rows="2" placeholder="直接对执行者说…（空闲=新任务；执行中 Enter=插话，■=中断）"></textarea>
+          <div class="exec-controls">
+            <span class="spacer"></span>
+            <button id="exec-send" class="round-send" title="发送" aria-label="发送">
+              <svg class="icon-send" viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 12.6V3.6M4.1 7.4 8 3.5l3.9 3.9"/></svg>
+              <svg class="icon-stop hidden" viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><rect x="4.4" y="4.4" width="7.2" height="7.2" rx="1.6" fill="currentColor"/></svg>
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
   </aside>
 </div>
 
 <div id="modal-mask" class="hidden">
   <div id="modal">
-    <h3>连接服务商</h3>
-    <label>角色 <select id="m-role"><option value="main">main</option><option value="executor">executor</option></select></label>
-    <label>服务商 <select id="m-preset"></select></label>
-    <label>模型 <input id="m-model"></label>
-    <label id="m-key-row">API key <input id="m-key" type="password" autocomplete="off"></label>
-    <div class="modal-buttons"><button id="m-cancel">取消</button><button id="m-ok" class="primary">连接</button></div>
-    <div id="m-result"></div>
+    <h3>设置</h3>
+    <div class="section-title">服务商 <span class="hint-inline">凭据全局共享，连一次两个角色都能用</span></div>
+    <div id="provider-list"></div>
+    <div id="m-result" class="hint"></div>
+    <div class="section-title">角色模型</div>
+    <div id="role-list"></div>
+    <details id="advanced">
+      <summary>高级</summary>
+      <div class="hint">自定义端点（协议 / 地址 / 手填模型兜底）</div>
+      <label>协议
+        <select id="adv-protocol">
+          <option value="openai">openai 兼容</option>
+          <option value="anthropic">anthropic 兼容</option>
+        </select>
+      </label>
+      <label>base_url <input id="adv-base-url" placeholder="留空 = 官方默认（需要 key）"></label>
+      <label>API key <input id="adv-key" type="password" autocomplete="off"></label>
+      <label>模型（可选，留空自动选）<input id="adv-model"></label>
+      <div class="modal-buttons"><button id="adv-connect">连接自定义端点</button></div>
+      <div class="hint" id="adv-result"></div>
+      <hr class="sep">
+      <div class="hint" id="cap-title">模型能力覆盖</div>
+      <label>角色
+        <select id="cap-role"><option value="main">main</option><option value="executor">executor</option></select>
+      </label>
+      <label>上下文窗口 <input id="cap-window" placeholder="留空 = 未知（不显示百分比）"></label>
+      <label>推理状态
+        <select id="cap-mode">
+          <option value="unknown">未知</option>
+          <option value="fixed">固定开启</option>
+          <option value="none">不支持推理</option>
+          <option value="adjustable">可调</option>
+        </select>
+      </label>
+      <label>可调强度 <input id="cap-levels" placeholder="如 off,low,medium,high"></label>
+      <label>最大输出 <input id="cap-max-output" placeholder="留空 = 未知"></label>
+      <label>工具支持
+        <select id="cap-tools"><option value="">未知</option><option value="yes">支持</option><option value="no">不支持</option></select>
+      </label>
+      <div class="hint" id="cap-source"></div>
+      <div class="hint" id="cap-help">来源为用户设置时覆盖 provider 返回值；留空的字段表示未知。</div>
+      <div class="modal-buttons"><button id="cap-save">保存能力</button><button id="cap-clear">清除覆盖</button></div>
+    </details>
+    <div class="modal-buttons"><button id="m-close">关闭</button></div>
+    <div class="hint" id="m-usage"></div>
+  </div>
+</div>
+
+<div id="key-modal-mask" class="hidden">
+  <div id="key-modal">
+    <div class="modal-head">
+      <button id="key-back" title="返回">←</button>
+      <h3 id="key-title">连接服务商</h3>
+      <span class="spacer"></span>
+      <button id="key-close" title="关闭">✕</button>
+    </div>
+    <p class="hint" id="key-desc"></p>
+    <label id="key-row"><span>API 密钥</span>
+      <input id="key-input" type="password" placeholder="API 密钥" autocomplete="off">
+    </label>
+    <div class="modal-buttons"><button id="key-submit" class="primary">继续</button></div>
+    <div id="key-result"></div>
+  </div>
+</div>
+
+<div id="model-modal-mask" class="hidden">
+  <div id="model-modal">
+    <div class="modal-head">
+      <h3>选择模型</h3>
+      <span class="spacer"></span>
+      <button id="mm-refresh" title="从 provider 刷新模型列表">↻ 刷新</button>
+      <button id="mm-close">关闭</button>
+    </div>
+    <input id="mm-search" placeholder="搜索模型 ID 或名称…" autocomplete="off">
+    <div id="mm-error" class="fs-error hidden"></div>
+    <div id="mm-groups"></div>
+    <details id="mm-manual-box">
+      <summary>手动输入模型（高级兜底）</summary>
+      <div class="modal-foot">
+        <select id="mm-manual-provider" title="手动输入所属 provider"></select>
+        <input id="mm-manual" placeholder="手动输入模型 ID" autocomplete="off">
+        <button id="mm-use-manual">使用</button>
+      </div>
+    </details>
   </div>
 </div>
 
@@ -183,410 +212,8 @@
 </div>
 
 <script src="/marked.min.js"></script>
-<script>
-"use strict";
-const $ = (id) => document.getElementById(id);
-const state = {
-  projects: {}, sessions: {}, current: null, activity: new Set(),
-  tasks: {}, steps: {}, currentTask: null, streamEl: null, planMode: false,
-};
-const PRESETS = {};
-
-/* ---------- WebSocket ---------- */
-const ws = new WebSocket(`ws://${location.host}/ws`);
-ws.onopen = () => { send({type: "list_projects"}); send({type: "list_sessions"}); };
-ws.onmessage = (e) => handle(JSON.parse(e.data));
-ws.onclose = () => note("连接已断开，请刷新");
-function send(obj) { ws.send(JSON.stringify(obj)); }
-
-async function loadPresets() {
-  const names = ["kimi-coding","deepseek","glm","qwen","openai","anthropic","ollama","custom"];
-  const sel = $("m-preset");
-  for (const n of names) {
-    const o = document.createElement("option"); o.value = n; o.textContent = n; sel.appendChild(o);
-  }
-}
-loadPresets();
-
-/* ---------- 事件路由 ---------- */
-function handle(ev) {
-  const t = ev.type;
-  if (t === "project_list") { state.projects = Object.fromEntries(ev.projects.map(p => [p.id, p])); renderTree(); return; }
-  if (t === "session_list") {
-    state.sessions = Object.fromEntries(ev.sessions.map(s => [s.id, s]));
-    if (!state.current && ev.sessions.length) selectSession(ev.sessions[0].id);
-    renderTree(); return;
-  }
-  if (t === "session_created") {
-    state.sessions[ev.session] = {id: ev.session, title: ev.title, project: ev.project};
-    if (state.wantNewSession) { state.wantNewSession = false; selectSession(ev.session); }
-    renderTree(); return;
-  }
-  if (t === "session_updated") {
-    if (state.sessions[ev.session]) state.sessions[ev.session].title = ev.title;
-    if (ev.session === state.current) $("current-title").textContent = ev.title;
-    renderTree(); return;
-  }
-  if (t === "session_deleted") {
-    delete state.sessions[ev.session];
-    state.activity.delete(ev.session);
-    if (ev.session === state.current) {
-      const rest = Object.keys(state.sessions);
-      state.current = null;
-      if (rest.length) selectSession(rest[0]);
-      else { state.wantNewSession = true; send({type: "new_session", title: ""}); }
-    }
-    renderTree(); return;
-  }
-  if (t === "project_created") { send({type: "list_projects"}); return; }
-  if (t === "provider_result") { $("m-result").textContent = ev.message; $("m-result").style.color = ev.ok ? "#7BAE7F" : "#DC6B5E"; return; }
-  if (t === "project_result") { $("p-result").textContent = ev.message; if (ev.ok) setTimeout(closeModal2, 600); return; }
-  if (t === "plan_mode") { state.planMode = ev.on; $("plan-toggle").checked = ev.on; return; }
-
-  const sid = ev.session;
-  if (t === "task_list") {
-    if (!sid || sid === state.current) renderTaskList(ev.tasks);
-    return;
-  }
-  if (sid && sid !== state.current) {
-    if (["text_delta","task_update","task_question","turn_end","subtask_step"].includes(t)) {
-      state.activity.add(sid); renderTree();
-    }
-    if (t !== "subtask_step") return;
-  }
-  if (t === "subtask_step") { pushStep(ev); return; }
-
-  switch (t) {
-    case "text_delta": appendText(ev.text); break;
-    case "turn_end": finalizeText(); break;
-    case "task_update": taskUpdate(ev); break;
-    case "task_question": card(`任务 #${ev.id} 提问`, ev.question); break;
-    case "confirm_request": confirmCard(ev); break;
-    case "usage": $("tokens").textContent = `tokens in ${ev.input} out ${ev.output}`; break;
-    case "context": $("ctx").textContent = `上下文 ${Math.round(ev.chars / Math.max(1, ev.threshold) * 100)}%`; break;
-    case "compacted": flash(`上下文已压缩 ${ev.before} → ${ev.after}`); break;
-    case "stopped": note("[已中断]"); break;
-    case "error": card("错误", ev.message, true); break;
-  }
-}
-
-function flash(text) { $("flash").textContent = text; setTimeout(() => $("flash").textContent = "", 4000); }
-function note(text) {
-  finalizeText();
-  const el = document.createElement("div"); el.className = "msg-note"; el.textContent = text;
-  stream().appendChild(el); scrollDown();
-}
-
-/* ---------- 对话流 ---------- */
-function stream() { return $("stream"); }
-function scrollDown() { const s = stream(); s.scrollTop = s.scrollHeight; }
-function appendText(text) {
-  if (!state.streamEl) {
-    state.streamEl = document.createElement("div");
-    state.streamEl.className = "msg-agent";
-    stream().appendChild(state.streamEl);
-  }
-  state.streamEl.textContent += text;
-  scrollDown();
-}
-function finalizeText() {
-  if (state.streamEl) {
-    const text = state.streamEl.textContent;
-    state.streamEl.innerHTML = sanitize(marked.parse(text));
-    state.streamEl = null;
-    scrollDown();
-  }
-}
-/* marked 默认不脱敏：清洗 script/iframe/object/embed 与 on* 属性，防模型输出 XSS */
-function sanitize(html) {
-  const doc = new DOMParser().parseFromString(html, "text/html");
-  doc.querySelectorAll("script, iframe, object, embed, link, meta").forEach(el => el.remove());
-  doc.querySelectorAll("*").forEach(el => {
-    for (const attr of [...el.attributes]) {
-      if (attr.name.toLowerCase().startsWith("on")) el.removeAttribute(attr.name);
-      if ((attr.name === "href" || attr.name === "src") && /^\s*javascript:/i.test(attr.value)) el.removeAttribute(attr.name);
-    }
-  });
-  return doc.body.innerHTML;
-}
-function userMsg(text) {
-  const el = document.createElement("div"); el.className = "msg-user"; el.textContent = text;
-  stream().appendChild(el); scrollDown();
-}
-function card(title, body, isError = false) {
-  finalizeText();
-  const el = document.createElement("div");
-  el.className = isError ? "card error-card" : "card";
-  const h = document.createElement("div"); h.className = "card-title"; h.textContent = title;
-  const b = document.createElement("div"); b.textContent = body;
-  el.append(h, b); stream().appendChild(el); scrollDown();
-}
-function taskUpdate(ev) {
-  state.tasks[ev.id] = ev.status;
-  card(`任务 #${ev.id} ${ev.status}`, ev.output || "");
-  refreshTasks();
-}
-function confirmCard(ev) {
-  finalizeText();
-  const el = document.createElement("div"); el.className = "card";
-  const h = document.createElement("div"); h.className = "card-title"; h.textContent = "⚠ 危险命令";
-  const cmd = document.createElement("pre"); cmd.textContent = ev.command;
-  const buttons = document.createElement("div"); buttons.className = "card-buttons";
-  const yes = document.createElement("button"); yes.textContent = "允许"; yes.className = "primary";
-  const no = document.createElement("button"); no.textContent = "拒绝";
-  const answer = (allow) => {
-    send({type: "confirm_response", id: ev.id, allow});
-    yes.disabled = no.disabled = true;
-    h.textContent = allow ? "⚠ 危险命令（已允许）" : "⚠ 危险命令（已拒绝）";
-  };
-  yes.onclick = () => answer(true); no.onclick = () => answer(false);
-  buttons.append(yes, no); el.append(h, cmd, buttons);
-  stream().appendChild(el); scrollDown();
-}
-
-/* ---------- 左栏 ---------- */
-function renderTree() {
-  const tree = $("project-tree"); tree.innerHTML = "";
-  for (const [pid, p] of Object.entries(state.projects)) {
-    const pEl = document.createElement("div");
-    const head = document.createElement("div"); head.className = "project-name";
-    head.innerHTML = `<span>📁 ${escapeHtml(p.name)}</span>`;
-    const add = document.createElement("button"); add.className = "add-session"; add.textContent = "+";
-    add.title = "新会话"; add.onclick = () => { state.wantNewSession = true; send({type: "new_session", project: pid, title: ""}); };
-    head.appendChild(add); pEl.appendChild(head);
-    for (const s of Object.values(state.sessions).filter(s => s.project === pid)) {
-      const el = document.createElement("div");
-      el.className = "session-item" + (s.id === state.current ? " active" : "") + (state.activity.has(s.id) ? " has-activity" : "");
-      const dot = document.createElement("span"); dot.className = "dot";
-      const label = document.createElement("span"); label.className = "label"; label.textContent = s.title || s.id.slice(0, 6);
-      const actions = document.createElement("span"); actions.className = "actions";
-      const rename = document.createElement("button"); rename.textContent = "✎"; rename.title = "重命名";
-      rename.onclick = (e) => {
-        e.stopPropagation();
-        const title = prompt("重命名会话", s.title || "");
-        if (title !== null && title.trim()) send({type: "rename_session", session: s.id, title: title.trim()});
-      };
-      const del = document.createElement("button"); del.textContent = "✕"; del.title = "删除";
-      del.onclick = (e) => {
-        e.stopPropagation();
-        if (confirm(`删除会话「${s.title || s.id.slice(0,6)}」？对话历史将一并删除。`))
-          send({type: "delete_session", session: s.id});
-      };
-      actions.append(rename, del);
-      el.append(dot, label, actions);
-      el.onclick = () => selectSession(s.id);
-      pEl.appendChild(el);
-    }
-    tree.appendChild(pEl);
-  }
-}
-function selectSession(sid) {
-  state.current = sid; state.activity.delete(sid);
-  state.streamEl = null; state.currentTask = null;
-  stream().innerHTML = ""; $("tokens").textContent = ""; $("ctx").textContent = "";
-  const s = state.sessions[sid];
-  $("current-title").textContent = s ? `${s.title || sid.slice(0,6)}` : "agent";
-  renderTree(); loadFileTree(); refreshTasks();
-}
-function escapeHtml(text) {
-  const d = document.createElement("div"); d.textContent = text; return d.innerHTML;
-}
-
-/* ---------- 右栏：文件 ---------- */
-async function loadFileTree(path = ".", container = null, depth = 0) {
-  if (!state.current || !state.sessions[state.current]) return;
-  const pid = state.sessions[state.current].project;
-  const resp = await fetch(`/api/ls?project=${pid}&path=${encodeURIComponent(path)}`);
-  const data = await resp.json();
-  if (data.error) return;
-  const parent = container || $("tab-files");
-  if (!container) parent.innerHTML = "";
-  for (const line of data.result.split("\n")) {
-    if (!line) continue;
-    const isDir = line.endsWith("/");
-    const name = isDir ? line.slice(0, -1) : line;
-    const el = document.createElement("div");
-    el.className = "tree-item" + (isDir ? " dir" : "");
-    el.style.paddingLeft = `${8 + depth * 14}px`;
-    el.textContent = (isDir ? "▸ " : "  ") + name;
-    el.onclick = () => isDir
-      ? loadFileTree(path === "." ? name : `${path}/${name}`, parent, 0)
-      : openFile(path === "." ? name : `${path}/${name}`);
-    parent.appendChild(el);
-  }
-}
-async function openFile(path) {
-  const pid = state.sessions[state.current].project;
-  const resp = await fetch(`/api/read?project=${pid}&path=${encodeURIComponent(path)}&limit=500`);
-  const data = await resp.json();
-  const page = $("tab-files");
-  const view = document.createElement("div"); view.className = "file-view";
-  const head = document.createElement("div"); head.className = "file-path";
-  const back = document.createElement("button"); back.textContent = "←";
-  back.onclick = () => { page.innerHTML = ""; loadFileTree(); };
-  head.append(back, document.createTextNode(path));
-  const pre = document.createElement("pre"); pre.textContent = data.result || data.error;
-  view.append(head, pre);
-  page.innerHTML = ""; page.appendChild(view);
-}
-
-/* ---------- 右栏：任务 ---------- */
-function refreshTasks() {
-  if (!state.current) return;
-  send({type: "list_tasks", session: state.current});
-}
-function renderTaskList(tasks) {
-  state.tasks = Object.fromEntries(tasks.map(t => [t.id, t.status]));
-  const page = $("tab-tasks");
-  if (state.currentTask) return; // 正在看某个任务的步骤流，不刷新列表
-  page.innerHTML = "";
-  for (const t of tasks.slice().reverse()) {
-    const el = document.createElement("div");
-    el.className = "task-item";
-    el.innerHTML = `<span>任务 #${t.id}</span><span class="task-status ${t.status}">${t.status}</span>`;
-    el.onclick = () => openTask(t.id);
-    page.appendChild(el);
-  }
-}
-function openTask(taskId) {
-  state.currentTask = taskId;
-  const page = $("tab-tasks"); page.innerHTML = "";
-  const back = document.createElement("button"); back.textContent = "← 任务列表";
-  back.onclick = () => { state.currentTask = null; refreshTasks(); };
-  const steps = document.createElement("div"); steps.className = "steps"; steps.id = "steps-view";
-  page.append(back, steps);
-  for (const s of (state.steps[taskId] || [])) steps.appendChild(stepEl(s));
-  steps.scrollTop = steps.scrollHeight;
-}
-function pushStep(ev) {
-  (state.steps[ev.task] = state.steps[ev.task] || []).push(ev);
-  if (state.currentTask === ev.task && ev.session === state.current) {
-    const view = $("steps-view");
-    if (view) { view.appendChild(stepEl(ev)); view.scrollTop = view.scrollHeight; }
-  }
-}
-function stepEl(ev) {
-  const el = document.createElement("div"); el.className = "step";
-  const kind = document.createElement("span"); kind.className = "step-kind";
-  kind.textContent = {text: "文本", tool_call: "工具", tool_result: "结果"}[ev.kind] || ev.kind;
-  const body = document.createElement("span"); body.textContent = ev.content;
-  el.append(kind, body);
-  return el;
-}
-
-/* ---------- 输入与命令 ---------- */
-$("btn-send").onclick = sendInput;
-$("input").addEventListener("keydown", (e) => {
-  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendInput(); }
-});
-function sendInput() {
-  const text = $("input").value.trim();
-  if (!text || !state.current) return;
-  send({type: "user", session: state.current, text});
-  userMsg(text); $("input").value = "";
-}
-$("btn-stop").onclick = () => send({type: "stop", session: state.current});
-$("plan-toggle").onchange = (e) => send({type: "set_plan_mode", on: e.target.checked});
-
-/* ---------- 弹窗 ---------- */
-$("btn-provider").onclick = () => $("modal-mask").classList.remove("hidden");
-$("m-cancel").onclick = () => { $("modal-mask").classList.add("hidden"); $("m-result").textContent = ""; };
-$("m-preset").onchange = () => { /* custom 时模型/key 手填，预设时由后端默认模型 */ };
-$("m-ok").onclick = () => {
-  const preset = $("m-preset").value;
-  const msg = {
-    type: "connect_provider", role: $("m-role").value,
-    model: $("m-model").value.trim(), api_key: $("m-key").value.trim(),
-  };
-  if (preset === "custom") {
-    msg.protocol = prompt("protocol（openai/anthropic）", "openai") || "openai";
-    msg.base_url = prompt("base_url", "") || null;
-    if (!msg.model) { $("m-result").textContent = "模型不能为空"; return; }
-    if (!msg.api_key) { $("m-result").textContent = "key 不能为空"; return; }
-  } else {
-    msg.preset = preset;  // 协议/地址/默认模型由后端预设表解析
-  }
-  send(msg);
-};
-$("btn-new-project").onclick = () => { $("modal2-mask").classList.remove("hidden"); browseDir(); };
-$("p-cancel").onclick = () => { $("modal2-mask").classList.add("hidden"); $("p-result").textContent = ""; };
-$("p-ok").onclick = () => {
-  send({type: "create_project", name: $("p-name").value.trim(), path: $("p-path").value.trim()});
-};
-
-/* 目录选择器 */
-let dirCurrentPath = "";
-async function browseDir(path) {
-  const url = path ? `/api/browse?path=${encodeURIComponent(path)}` : "/api/browse";
-  const resp = await fetch(url);
-  const data = await resp.json();
-  if (data.error) { $("dir-current").textContent = data.error; return; }
-  dirCurrentPath = data.path;
-  $("dir-current").textContent = data.path;
-  const list = $("dir-list"); list.innerHTML = "";
-  const parent = document.createElement("div");
-  parent.className = "dir-item parent"; parent.textContent = "..（上一级）";
-  parent.onclick = () => browseDir(data.parent);
-  list.appendChild(parent);
-  for (const d of data.dirs) {
-    const el = document.createElement("div");
-    el.className = "dir-item"; el.textContent = "📁 " + d;
-    el.onclick = () => browseDir(data.path + "/" + d);
-    list.appendChild(el);
-  }
-}
-$("p-pick").onclick = () => { $("p-path").value = dirCurrentPath; };
-
-/* 侧栏拖动调宽与收起 */
-function makeResizable(handleId, side) {
-  const handle = $(handleId);
-  const pane = $(side);
-  const varName = side === "left" ? "--left-w" : "--right-w";
-  handle.addEventListener("mousedown", (e) => {
-    e.preventDefault();
-    const startX = e.clientX;
-    const startW = pane.getBoundingClientRect().width;
-    const move = (ev) => {
-      const dx = ev.clientX - startX;
-      const w = Math.max(120, Math.min(700, side === "left" ? startW + dx : startW - dx));
-      $("app").style.setProperty(varName, w + "px");
-    };
-    const up = () => {
-      document.removeEventListener("mousemove", move);
-      document.removeEventListener("mouseup", up);
-    };
-    document.addEventListener("mousemove", move);
-    document.addEventListener("mouseup", up);
-  });
-}
-makeResizable("div-left", "left");
-makeResizable("div-right", "right");
-
-function togglePane(side) {
-  const pane = $(side);
-  const varName = side === "left" ? "--left-w" : "--right-w";
-  if (pane.style.display === "none") {
-    pane.style.display = "";
-    $("app").style.setProperty(varName, (side === "left" ? 240 : 320) + "px");
-  } else {
-    pane.style.display = "none";
-    $("app").style.setProperty(varName, "0px");
-  }
-}
-$("collapse-left").onclick = () => togglePane("left");
-$("collapse-right").onclick = () => togglePane("right");
-function closeModal2() { $("modal2-mask").classList.add("hidden"); $("p-result").textContent = ""; $("p-name").value = ""; $("p-path").value = ""; }
-
-/* tabs */
-for (const tab of document.querySelectorAll(".tab")) {
-  tab.onclick = () => {
-    document.querySelectorAll(".tab").forEach(t => t.classList.remove("active"));
-    tab.classList.add("active");
-    $("tab-files").classList.toggle("hidden", tab.dataset.tab !== "files");
-    $("tab-tasks").classList.toggle("hidden", tab.dataset.tab !== "tasks");
-    if (tab.dataset.tab === "tasks") refreshTasks();
-  };
-}
-</script>
+<script src="/katex/katex.min.js"></script>
+<script src="/katex/contrib/auto-render.min.js"></script>
+<script type="module" src="/app.js"></script>
 </body>
 </html>

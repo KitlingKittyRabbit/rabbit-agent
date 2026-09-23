@@ -27,12 +27,19 @@ def _safe_path(root: Path, path: str) -> Path:
 
 def _walk_files(base: Path):
     if base.is_file():
-        yield base
+        if not base.is_symlink():  # symlink 目标可能在 root 外，一律不跟随
+            yield base
         return
     for dirpath, dirnames, filenames in os.walk(base):
-        dirnames[:] = [d for d in dirnames if d not in _IGNORE_DIRS]
+        dirnames[:] = [
+            d
+            for d in dirnames
+            if d not in _IGNORE_DIRS and not (Path(dirpath) / d).is_symlink()
+        ]
         for name in filenames:
             file = Path(dirpath) / name
+            if file.is_symlink():
+                continue  # 防 symlink 逃逸（目标可能指向 root 外敏感文件）
             try:
                 if file.stat().st_size > _MAX_FILE_SIZE:
                     continue
