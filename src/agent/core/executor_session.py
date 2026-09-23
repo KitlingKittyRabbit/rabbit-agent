@@ -157,9 +157,14 @@ class ExecutorSession:
         registry = self._registry
         if registry.executor_provider is None:
             raise ExecutorUnconfigured("executor 未配置，任务未执行（请先连接 executor）")
+        plan = registry.plan_mode
         tools = build_registry(
-            self._root(), write=not registry.plan_mode, shell=not registry.plan_mode,
+            self._root(), write=not plan, shell=not plan,
             on_call=self._audit_call, confirm=self._confirm,
+            # 宿主 GitHub/Git：普通执行者可用（每次显式指定账号）；
+            # plan 模式保持纯本地只读探索，不挂任何 GitHub/Git 工具
+            host_github="write" if not plan else "off",
+            host_git=not plan,
         )
         for tool in extra_tools:
             tools.add(tool)
