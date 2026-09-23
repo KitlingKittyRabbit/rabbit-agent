@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Callable, Sequence
 
 from ..providers import Message, ToolSpec, Usage
@@ -94,6 +95,7 @@ async def compact_messages(
     on_compacted: Callable[[dict], None] | None = None,
     usage: Usage | None = None,
     preserve: Message | None = None,
+    session_id: str | None = None,
 ) -> bool:
     """接近动态阈值时把旧历史压成 [前情摘要] 替换（只在 user 边界切割）。
 
@@ -133,8 +135,14 @@ async def compact_messages(
         return False
     before = estimate_chars(messages)
     serialized = serialize_for_summary(old, before)  # old ⊆ messages，不再二次截断
+    kwargs: dict = {}
+    try:
+        if "session_id" in inspect.signature(provider.chat).parameters:
+            kwargs["session_id"] = session_id
+    except (TypeError, ValueError):
+        pass
     result = await provider.chat(
-        [Message(role="user", content=f"{COMPACT_PROMPT}\n\n{serialized}")]
+        [Message(role="user", content=f"{COMPACT_PROMPT}\n\n{serialized}")], **kwargs
     )
     if usage is not None:
         usage.input_tokens += result.usage.input_tokens

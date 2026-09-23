@@ -484,6 +484,9 @@ export function providerListState(providerStatus) {
       configured: Boolean(spec.configured),
       needsKey: spec.needs_key !== false,
       hasKey: live ? Boolean(live.has_key) : false,
+      login: spec.login || "",
+      hint: spec.hint || "",
+      loggedIn: Boolean(((providerStatus || {}).codex_login || {}).logged_in),
       modelCount: live ? live.model_count || 0 : 0,
     };
   });
@@ -621,4 +624,84 @@ function indentedCodeRanges(seg) {
   }
   if (start >= 0) ranges.push([start, seg.length - 1]);
   return ranges;
+}
+
+export function diffSummary(events) {
+  // 汇总回合内所有 task_diff：{files:[{path,added,removed}], added, removed, label}
+  const files = new Map();
+  for (const e of events || []) {
+    if (!e || e.type !== "task_diff" || !e.text) continue;
+    let payload = null;
+    try { payload = JSON.parse(e.text); } catch (err) { continue; }
+    for (const f of (payload && payload.files) || []) {
+      if (!f || !f.path) continue;
+      const cur = files.get(f.path) || {path: f.path, added: 0, removed: 0};
+      cur.added += Number(f.added) || 0;
+      cur.removed += Number(f.removed) || 0;
+      files.set(f.path, cur);
+    }
+  }
+  const list = [...files.values()].sort((a, b) => a.path.localeCompare(b.path));
+  return {
+    files: list,
+    added: list.reduce((sum, f) => sum + f.added, 0),
+    removed: list.reduce((sum, f) => sum + f.removed, 0),
+    label: list.length ? `${list.length} 个文件已更改` : "",
+  };
+}
+
+export function mentionQuery(text, caret) {
+  // 光标前最近的 @片段（行首/空白后触发；词中 @ 不触发）
+  const upto = String(text || "").slice(0, Math.max(0, Number(caret) || 0));
+  const match = /(^|[\s(\[])(@[^\s@\[\]()]*)$/.exec(upto);
+  if (!match) return null;
+  const fragment = match[2];
+  return {start: upto.length - fragment.length, query: fragment.slice(1)};
+}
+
+export function insertMention(text, start, end, path) {
+  // 用 @路径 替换 @片段；后面紧贴文字时补一个空格
+  const src = String(text || "");
+  const before = src.slice(0, start);
+  const after = src.slice(end);
+  const inserted = `@${path}`;
+  const pad = after && !/^[\s,，。;；)]/.test(after) ? " " : "";
+  return {text: before + inserted + pad + after, caret: (before + inserted + pad).length};
+}
+
+export function commandQuery(text, caret) {
+  // 光标前的 /命令片段（行首或空白后触发）
+  const upto = String(text || "").slice(0, Math.max(0, Number(caret) || 0));
+  const match = /(^|[\s])(\/[A-Za-z0-9_-]*)$/.exec(upto);
+  if (!match) return null;
+  const fragment = match[2];
+  return {start: upto.length - fragment.length, query: fragment};
+}
+
+export function pendingBindPlan(batchText, pendingTexts) {
+  // 本回合文本从开头起能匹配哪些待绑定气泡：
+  // - skip：被并入上一回合、无法单独撤销的前导气泡
+  // - bind：本回合可绑定的气泡数（合并消息时 >1）
+  const text = String(batchText || "");
+  const list = Array.isArray(pendingTexts) ? pendingTexts : [];
+  if (!text || !list.length) return {skip: list.length, bind: 0};
+  for (let first = 0; first < list.length; first += 1) {
+    const head = String(list[first] || "");
+    // 必须从批次开头整行匹配（行边界），避免“继续”错配“继续做这件事”
+    if (!head || !text.startsWith(head)) continue;
+    const after = text.slice(head.length, head.length + 1);
+    if (after && after !== "\n") continue;
+    let joined = head;
+    let bind = 1;
+    for (let i = first + 1; i < list.length; i += 1) {
+      const next = `${joined}\n${String(list[i] || "")}`;
+      if (!text.startsWith(next)) break;
+      const tail = text.slice(next.length, next.length + 1);
+      if (tail && tail !== "\n") break;
+      joined = next;
+      bind += 1;
+    }
+    return {skip: first, bind};
+  }
+  return {skip: list.length, bind: 0};
 }

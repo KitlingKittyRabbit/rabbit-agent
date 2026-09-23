@@ -57,6 +57,16 @@ PRESETS: dict[str, dict] = {
         "model": "deepseek-v4.1-flash",
         "needs_key": True,
     },
+    "chatgpt": {
+        "label": "ChatGPT（会员登录）",
+        "protocol": "openai-responses",
+        "base_url": "https://chatgpt.com/backend-api/codex",
+        "model": "",           # 留空：连接时自动选本机 Codex 缓存里的第一个可用模型
+        "needs_key": False,
+        "login": "codex",
+        "hint": "非官方接口（与 opencode 同路），可能随 OpenAI 变更失效，请自行评估账号风险；"
+                "未装系统钥匙串时令牌会以明文存本机 keys.json（600）",
+    },
     "ollama": {
         "label": "Ollama（本地）",
         "protocol": "openai",

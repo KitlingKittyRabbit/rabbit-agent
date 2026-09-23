@@ -48,7 +48,22 @@ def test_capability_mapping_toggle_and_effort():
     assert cap.reasoning_mode == "adjustable"
     assert cap.levels == ("off", "low", "high", "max")  # toggle 补 off
     assert cap.tools is True and cap.reasoning_returned is True
+    assert cap.interleaved == "reasoning_content"  # 回传字段名必须保留
     assert cap.source == "catalog"
+
+
+def test_capability_interleaved_absent_stays_none():
+    cap = capability_from_catalog(FIXTURE["zai"]["models"]["glm-x"], "openai")
+    assert cap.interleaved is None
+
+
+def test_capability_as_dict_includes_interleaved():
+    from agent.providers import ModelCapability
+
+    assert ModelCapability(interleaved="reasoning_content").as_dict()["interleaved"] == (
+        "reasoning_content"
+    )
+    assert ModelCapability().as_dict()["interleaved"] is None
 
 
 def test_capability_mapping_reasoning_none_and_toggle_only_and_budget():

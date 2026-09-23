@@ -45,6 +45,7 @@ class ModelCapability:
     levels: tuple[str, ...] | None = None
     max_output: int | None = None
     tools: bool | None = None
+    interleaved: str | None = None  # 思考回传字段名（如 reasoning_content）；目录声明才回传
     source: str = "unknown"  # provider | user | unknown
 
     def as_dict(self) -> dict:
@@ -55,6 +56,7 @@ class ModelCapability:
             "levels": list(self.levels) if self.levels is not None else None,
             "max_output": self.max_output,
             "tools": self.tools,
+            "interleaved": self.interleaved,
             "source": self.source,
         }
 
@@ -127,3 +129,16 @@ class Provider(Protocol):
         on_text: OnText | None = None,
         on_reasoning: OnReasoning | None = None,
     ) -> ChatResult: ...
+
+
+def is_opencode_host(base_url: str | None) -> bool:
+    """OpenCode Zen/Go 网关主机判定（go/zen 的会话头只发给该站及其子域）。"""
+    from urllib.parse import urlparse
+
+    if not base_url:
+        return False
+    try:
+        host = (urlparse(str(base_url)).hostname or "").rstrip(".").lower()
+    except ValueError:
+        return False
+    return host == "opencode.ai" or host.endswith(".opencode.ai")

@@ -81,6 +81,8 @@ async def _receive(ws, state: CliState) -> None:
             print(f"\n[任务 #{event['id']} 提问] {event['question']}")
         elif kind == "plan_mode":
             print(f"[plan 模式 {'开' if event['on'] else '关'}]")
+        elif kind == "notice":
+            print(f"\n[提示] {event['message']}")
         elif kind == "provider_result":
             mark = "✓" if event["ok"] else "✗"
             print(f"\n[{mark}] {event['role']}: {event['message']}")

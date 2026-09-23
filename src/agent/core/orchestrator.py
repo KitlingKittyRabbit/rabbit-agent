@@ -12,12 +12,15 @@ from uuid import uuid4
 
 from ..providers import Provider
 from .audit import AuditLogger
+from .codex_import import import_conversation
 from .config import make_provider
 from .conversation import Conversation
 from .presets import PRESETS
 from .project_store import save_project
 from .provider_manager import ProviderManager
+from .provider_store import derive_provider_id
 from .session import SessionStore
+from .skills import find_skill, list_skills, skill_prompt
 
 
 class _EventBus:
@@ -220,6 +223,8 @@ class Orchestrator:
             if conv is None:
                 self.emit({"type": "error", "message": f"会话不存在: {data.get('session')}"})
             elif text:
+                if text.startswith("/") and self._handle_command(conv, text):
+                    return
                 conv.enqueue_user(text)
         elif msg_type == "new_session":
             self.create_session(
@@ -288,6 +293,31 @@ class Orchestrator:
             conv = self.conversations.get(str(data.get("session") or ""))
             if conv is not None:
                 conv.executor_stop()
+        elif msg_type == "undo_message":
+            asyncio.get_running_loop().create_task(self._undo_message(data))
+        elif msg_type == "codex_login":
+            asyncio.get_running_loop().create_task(self._codex_login())
+        elif msg_type == "codex_logout":
+            asyncio.get_running_loop().create_task(self._codex_logout())
+        elif msg_type == "import_codex":
+            conv = self.conversations.get(str(data.get("session") or ""))
+            codex_id = str(data.get("codex_session") or "").strip()
+            project_id = str(data.get("project") or "").strip()
+            if not project_id and conv is not None:
+                project_id = conv.project_id
+            if not project_id:
+                self.emit({"type": "error", "message": "缺少项目，无法导入"})
+            elif self.project_root(project_id) is None:
+                self.emit({"type": "error", "message": f"项目不存在: {project_id}"})
+            else:
+                try:
+                    info = self.import_codex_session(project_id, codex_id)
+                except (FileNotFoundError, ValueError, RuntimeError) as e:
+                    self.emit({"type": "error", "message": str(e)})
+                else:
+                    self.emit({"type": "notice", "message": (
+                        f"已导入 Codex 会话为 {info['session']}"
+                        f"（{info['turns']} 轮对话）")})
         elif msg_type == "set_executor_report":
             conv = self.conversations.get(str(data.get("session") or ""))
             if conv is not None:
@@ -420,6 +450,7 @@ class Orchestrator:
                 for pid, entry in self._providers.items()
             ],
             "presets": self._presets_status(),
+            "codex_login": self._codex_login_status(),
             "max_steps": {"main": self.max_steps_main, "executor": self.max_steps_executor},
             "plan_mode": self.plan_mode,
         }
@@ -433,6 +464,124 @@ class Orchestrator:
         self.emit(result)
         self.emit(self.provider_status())
         self.emit(self.model_catalog())
+
+    async def _undo_message(self, data: dict) -> None:
+        conv = self.conversations.get(str(data.get("session") or ""))
+        try:
+            turn_id = int(data.get("turn") or 0)
+        except (TypeError, ValueError):
+            turn_id = 0
+        if conv is None:
+            self.emit({"type": "error", "message": "会话不存在，无法撤销"})
+            return
+        supported = conv.undo_supported(turn_id)
+        if supported is None:
+            self.emit({"type": "error", "message": "要撤销的消息不存在（可能已被撤销）"})
+            return
+        if not supported:
+            self.emit({"type": "error", "message": (
+                "这条消息来自旧数据（缺少消息边界记录），不支持撤销；之后的新消息不受影响")})
+            return
+        await conv.stop_and_wait()     # 停止并等取消落定，再回滚
+        try:
+            text = conv.undo_turn(turn_id)
+        except ValueError as e:
+            self.emit({"type": "error", "message": str(e)})
+            return
+        if text is None:
+            self.emit({"type": "error", "message": "要撤销的消息不存在（可能已被撤销）"})
+
+    @staticmethod
+    def _codex_login_status() -> dict:
+        from ..providers.codex_auth import load_tokens
+
+        tokens = load_tokens()
+        if not tokens:
+            return {"logged_in": False}
+        account = str(tokens.get("accountId") or "")
+        return {"logged_in": True, "account": (account[:8] + "…") if account else ""}
+
+    async def _codex_login(self) -> None:
+        """ChatGPT 会员登录：浏览器 OAuth（阻塞流程放线程里跑）。"""
+        from ..providers import codex_auth
+
+        loop = asyncio.get_running_loop()
+
+        def announce(url: str) -> None:
+            loop.call_soon_threadsafe(
+                self.emit, {"type": "codex_login", "state": "pending", "url": url})
+
+        try:
+            tokens = await asyncio.to_thread(codex_auth.login, on_url=announce)
+        except Exception as e:
+            self.emit({"type": "error", "message": f"ChatGPT 登录失败：{e}"})
+            self.emit(self.provider_status())
+            return
+        account = str(tokens.get("accountId") or "")
+        self.emit({"type": "notice", "message": (
+            f"ChatGPT 登录成功（账号 {account[:8] or '未知'}…）")})
+        preset = PRESETS["chatgpt"]
+        result = await self.connect_provider(
+            "", protocol=preset["protocol"], base_url=preset["base_url"],
+            model="", api_key="", preset="chatgpt",
+        )
+        self.emit(result)
+        self.emit(self.provider_status())
+        self.emit(self.model_catalog())
+
+    async def _codex_logout(self) -> None:
+        from ..providers import codex_auth
+
+        codex_auth.delete_tokens()
+        preset = PRESETS["chatgpt"]
+        pid = derive_provider_id(preset["protocol"], preset["base_url"])
+        self.disconnect_provider(pid)      # 没有可断凭据时返回失败，忽略
+        self.emit({"type": "notice", "message": "已退出 ChatGPT 登录"})
+        self.emit(self.provider_status())
+        self.emit(self.model_catalog())
+
+    def import_codex_session(self, project_id: str, session_id: str) -> dict:
+        """导入 Codex 会话到指定项目，注册成新会话并广播。"""
+        if self.store is None:
+            raise RuntimeError("无会话存储，无法导入")
+        info = import_conversation(
+            self.store, session_id=session_id, project_id=project_id,
+        )
+        conv = self._add_conversation(
+            session_id=info["session"], project_id=project_id,
+            title=f"codex · {session_id[:8]}",
+        )
+        self.emit({"type": "session_created", "session": conv.id,
+                   "title": conv.title, "project": project_id, "focus": True})
+        return info
+
+    def _handle_command(self, conv, text: str) -> bool:
+        """斜杠命令：技能唤起/列表（普通消息返回 False 走常规流程）。"""
+        parts = text.split(maxsplit=2)
+        command = parts[0]
+        root = self.project_root(conv.project_id)
+        if command in ("/skills", "/skill") and len(parts) == 1:
+            skills = list_skills(root)
+            if not skills:
+                self.emit({"type": "notice", "message": (
+                    "还没有技能：在 <项目>/.agent/skills/<名称>/SKILL.md "
+                    "或 ~/.agent/skills/ 下创建")})
+            else:
+                lines = [f"/skill {s['name']} — {s['description'] or '（无描述）'}（{s['scope']}）"
+                         for s in skills]
+                self.emit({"type": "notice", "message": "可用技能：\n" + "\n".join(lines)})
+            return True
+        if command == "/skill":
+            name = parts[1] if len(parts) > 1 else ""
+            spec = find_skill(root, name)
+            if spec is None:
+                self.emit({"type": "error",
+                           "message": f"未找到技能 {name or '（空）'}：/skills 查看可用技能"})
+                return True
+            rest = parts[2] if len(parts) > 2 else ""
+            conv.enqueue_user(skill_prompt(spec, rest))
+            return True
+        return False
 
     async def _connect(self, data: dict) -> None:
         """页面/WS 连接入口：密钥需求判断统一由 connect_provider 负责，这里不改写 key。"""

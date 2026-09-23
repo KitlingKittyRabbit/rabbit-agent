@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import AsyncIterator, Sequence
+from uuid import uuid4
 
 import httpx2
 import openai
@@ -20,6 +21,7 @@ from .base import (
     ToolCall,
     ToolSpec,
     Usage,
+    is_opencode_host,
 )
 from .listing import fetch_models
 
@@ -40,12 +42,15 @@ class OpenAICompatProvider:
         http_client: object | None = None,
         context_window: int | None = None,
         reasoning_effort: str | None = None,
+        echo_reasoning_field: str | None = None,
     ) -> None:
         self._model = model
         self._base_url = base_url
         self._api_key = api_key
         self.context_window = context_window
         self._reasoning_effort = reasoning_effort
+        # 目录声明 interleaved 的模型：assistant 消息按该字段回传思考，否则网关 400
+        self._echo_reasoning_field = echo_reasoning_field
         client_kwargs: dict = {
             "api_key": api_key,
             "timeout": timeout,
@@ -59,10 +64,22 @@ class OpenAICompatProvider:
             # trust_env=False：不吃环境代理变量（桌面代理 socks:// 等会让 SDK 初始化崩溃）
             client_kwargs["http_client"] = httpx2.AsyncClient(trust_env=False)
         self._client = openai.AsyncOpenAI(**client_kwargs)
+        self._opencode_host = is_opencode_host(base_url)
+        self._session_fallback = uuid4().hex
+
+    def _session_headers(self, session_id: str | None) -> dict | None:
+        """OpenCode Go/Zen 网关要求自定义 UA + 每会话稳定的 x-opencode-session。"""
+        if not self._opencode_host:
+            return None
+        return {
+            "User-Agent": "rabbit-agent/0.1",
+            "x-opencode-session": session_id or self._session_fallback,
+        }
 
     async def list_models(self) -> list[dict]:
         """拉取 provider 真实模型列表（内存凭据，不进 URL/日志）。"""
-        return await fetch_models("openai", self._base_url, self._api_key)
+        return await fetch_models("openai", self._base_url, self._api_key,
+                                  session_id=self._session_fallback)
 
     async def chat(
         self,
@@ -70,12 +87,16 @@ class OpenAICompatProvider:
         tools: Sequence[ToolSpec] | None = None,
         on_text: OnText | None = None,
         on_reasoning: OnReasoning | None = None,
+        session_id: str | None = None,
     ) -> ChatResult:
         kwargs: dict = {
             "model": self._model,
             "messages": [self._convert_message(m) for m in messages],
             "stream": True,
         }
+        headers = self._session_headers(session_id)
+        if headers:
+            kwargs["extra_headers"] = headers
         if tools:
             kwargs["tools"] = [self._convert_tool(t) for t in tools]
         if self._reasoning_effort and self._reasoning_effort != "off":
@@ -101,10 +122,9 @@ class OpenAICompatProvider:
         message = str(error).lower()
         return "context" in message or "too long" in message
 
-    @staticmethod
-    def _convert_message(message: Message) -> dict:
+    def _convert_message(self, message: Message) -> dict:
         if message.role == "assistant" and message.tool_calls:
-            return {
+            payload = {
                 "role": "assistant",
                 "content": message.content or None,
                 "tool_calls": [
@@ -116,13 +136,21 @@ class OpenAICompatProvider:
                     for tc in message.tool_calls
                 ],
             }
-        if message.role == "tool":
+        elif message.role == "tool":
             return {
                 "role": "tool",
                 "tool_call_id": message.tool_call_id,
                 "content": message.content,
             }
-        return {"role": message.role, "content": message.content}
+        else:
+            payload = {"role": message.role, "content": message.content}
+        if (
+            self._echo_reasoning_field
+            and message.role == "assistant"
+            and message.reasoning
+        ):
+            payload[self._echo_reasoning_field] = message.reasoning
+        return payload
 
     @staticmethod
     def _convert_tool(tool: ToolSpec) -> dict:
@@ -197,3 +225,5 @@ class OpenAICompatProvider:
             except json.JSONDecodeError as e:
                 raise ProviderError(f"工具参数不是合法 JSON: {slot['args']!r}") from e
         return ToolCall(id=slot["id"], name=slot["name"], arguments=arguments)
+
+

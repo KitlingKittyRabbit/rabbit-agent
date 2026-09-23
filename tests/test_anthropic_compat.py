@@ -265,3 +265,42 @@ async def test_connection_error_maps_to_provider_error() -> None:
 
     with pytest.raises(ProviderError):
         await make_provider(handler).chat([Message(role="user", content="x")])
+
+
+async def test_opencode_anthropic_host_sends_session_header() -> None:
+    """Anthropic 协议走 opencode.ai 时同样带 x-opencode-session + 自定义 UA。"""
+    from agent.providers.base import is_opencode_host
+
+    assert is_opencode_host("https://opencode.ai/zen/v1") is True
+    seen: dict = {}
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        seen["ua"] = request.headers.get("user-agent")
+        seen["sid"] = request.headers.get("x-opencode-session")
+        return httpx2.Response(200, content=text_events(), headers=SSE_HEADERS)
+
+    client = httpx2.AsyncClient(transport=httpx2.MockTransport(handler))
+    provider = AnthropicCompatProvider(
+        base_url="https://opencode.ai/zen/v1", api_key="sk-zen",
+        model="qwen3.8-max", http_client=client,
+    )
+    await provider.chat([Message(role="user", content="ping")], session_id="sess-9")
+
+    assert seen["sid"] == "sess-9"
+    assert seen["ua"] and "rabbit-agent" in seen["ua"]
+
+
+async def test_non_opencode_anthropic_host_sends_no_session_header() -> None:
+    seen: dict = {}
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        seen["sid"] = request.headers.get("x-opencode-session")
+        return httpx2.Response(200, content=text_events(), headers=SSE_HEADERS)
+
+    client = httpx2.AsyncClient(transport=httpx2.MockTransport(handler))
+    provider = AnthropicCompatProvider(
+        base_url="https://api.anthropic.com", api_key="sk-a",
+        model="claude-test", http_client=client,
+    )
+    await provider.chat([Message(role="user", content="ping")], session_id="sess-1")
+    assert seen["sid"] is None

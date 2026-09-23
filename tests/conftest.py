@@ -35,3 +35,31 @@ def _no_real_catalog_fetch(monkeypatch):
     async def _boom():
         raise AssertionError("测试不得拉取 models.dev（外部网络）")
     monkeypatch.setattr("agent.core.provider_manager.fetch_catalog", _boom)
+
+
+@pytest.fixture(autouse=True)
+def _disable_real_keyring(monkeypatch):
+    """每个测试都强制文件模式（用 monkeypatch，结束后恢复；不会永久丢掉开关）。"""
+    monkeypatch.setenv("RABBIT_AGENT_KEYRING", "0")
+
+
+def _real_keyring_values():
+    """真实系统钥匙串里本项目条目的快照（读失败返回 None）。"""
+    import json
+
+    import keyring
+    try:
+        names = list(json.loads(REAL_KEYS.read_text(encoding="utf-8")).keys())
+        return {name: keyring.get_password("rabbit-agent", name) for name in names}
+    except Exception:
+        return None
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _guard_real_keyring():
+    """安全网：整个测试会话内真实系统钥匙串不得被改写。"""
+    before = _real_keyring_values()
+    yield
+    after = _real_keyring_values()
+    if before is not None and after is not None:
+        assert after == before, "测试改写了真实系统钥匙串（rabbit-agent/*）！"

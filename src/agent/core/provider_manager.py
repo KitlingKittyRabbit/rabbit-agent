@@ -26,7 +26,7 @@ from ..providers.listing import ModelListingError, _capability_gives, merge_capa
 from . import keystore
 from .config import make_provider
 from .context import context_budget
-from .keystore import delete_key, load_keys, save_key
+from .keystore import delete_key, load_keys, migrate_keys, save_key
 from .presets import PRESETS
 from .provider_store import (
     clean_override,
@@ -60,6 +60,8 @@ def _client_base_url(provider: Provider) -> str | None:
 
 def _infer_protocol(provider: Provider) -> str:
     name = type(provider).__name__.lower()
+    if "codexresponses" in name:
+        return "openai-responses"
     if "anthropic" in name:
         return "anthropic"
     if "openai" in name:
@@ -100,6 +102,7 @@ class ProviderManager:
         self._efforts: dict[str, str] = {"main": "off", "executor": "off"}
         self._capabilities: dict[str, dict] = {"main": {}, "executor": {}}
         self._catalog_cache_ttl = 300.0
+        migrate_keys(self._keys_path)   # 明文密钥迁入系统钥匙串（不可用则保持文件）
         self._load_registry()
         # 公共目录：启动只读磁盘缓存，绝不外呼；过期/缺失留给按需拉取
         cached = load_catalog(self._catalog_path())
@@ -164,9 +167,13 @@ class ProviderManager:
         if "://" not in raw:
             return True  # 无 scheme 的地址不是明确的本地端点：按官方处理
         try:
-            host = (urlparse(raw).hostname or "").rstrip(".").lower()
+            parsed = urlparse(raw)
+            host = (parsed.hostname or "").rstrip(".").lower()
+            path = parsed.path or ""
         except ValueError:
             return True  # 畸形 URL 不是明确的本地端点：按官方处理
+        if host == "chatgpt.com" and "/backend-api/codex" in path:
+            return False     # ChatGPT 会员登录（Codex 端点）：凭据走 OAuth，不要 API key
         return host in _KEY_REQUIRED_HOSTS
 
 
@@ -356,6 +363,7 @@ class ProviderManager:
             protocol=entry["protocol"], base_url=entry["base_url"], model=model,
             api_key=api_key, context_window=capability.window,
             reasoning_effort=binding.get("reasoning_effort") or "off",
+            echo_reasoning_field=capability.interleaved,
         )
 
 
@@ -871,7 +879,7 @@ class ProviderManager:
         if role not in ("", "main", "executor"):
             return {"type": "provider_result", "role": role, "ok": False,
                     "message": f"未知角色: {role}（可选: 空 / main / executor）"}
-        if protocol not in ("openai", "anthropic"):
+        if protocol not in ("openai", "anthropic", "openai-responses"):
             return {"type": "provider_result", "role": role, "ok": False,
                     "message": "协议无效"}
         pid = derive_provider_id(protocol, base_url)
@@ -952,6 +960,7 @@ class ProviderManager:
                 reasoning_effort=(
                     reasoning_effort if capability.reasoning_mode == "adjustable" else "off"
                 ),
+                echo_reasoning_field=capability.interleaved,
             )
         except Exception as e:
             return {"type": "provider_result", "role": role, "ok": False,

@@ -7,10 +7,13 @@ import {
   capabilityOverrideFromForm,
   connectRequestForRow,
   connectRowPlan,
+  commandQuery,
   composerLayout,
   effortLabel,
   executorMessageView,
   effortState,
+  diffSummary,
+  pendingBindPlan,
   extractChanges,
   finalPreview,
   filterModels,
@@ -18,8 +21,10 @@ import {
   hasWork,
   inspectorLines,
   extractMath,
+  insertMention,
   isSystemTurn,
   liveBufferStale,
+  mentionQuery,
   mergeTask,
   modelMenuState,
   modelSelectAction,
@@ -105,7 +110,10 @@ function handle(ev) {
   }
   if (t === "session_created") {
     state.sessions[ev.session] = {id: ev.session, title: ev.title, project: ev.project};
-    if (state.wantNewSession) { state.wantNewSession = false; selectSession(ev.session); }
+    if (state.wantNewSession || ev.focus) {
+      state.wantNewSession = false;
+      selectSession(ev.session);
+    }
     renderTree(); return;
   }
   if (t === "session_updated") {
@@ -185,7 +193,35 @@ function handle(ev) {
     maybeRefreshExecutor(ev.session);
     return;
   }
-  if (t === "error") { note(`[错误] ${ev.message}`); return; }
+  if (t === "error") {
+    note(`[错误] ${ev.message}`);
+    if (importPending) {
+      importPending = false;
+      $("import-submit").disabled = false;     // 失败后可原地重试
+      $("import-result").textContent = `导入失败：${ev.message}`;
+    }
+    return;
+  }
+  if (t === "undo_done") {
+    dropPendingTurns();
+    loadTimeline();
+    renderFiles(state.fsPath || ".");
+    note("已撤销该消息，内容已放回输入框");
+    const input = $("input");
+    input.value = ev.text || "";
+    input.focus();
+    input.setSelectionRange(input.value.length, input.value.length);
+    return;
+  }
+  if (t === "codex_login") {
+    note(`已打开浏览器完成 ChatGPT 登录；若没弹出，手动打开：${ev.url || ""}`);
+    return;
+  }
+  if (t === "notice") {
+    note(ev.message);
+    if (importPending) { importPending = false; closeImportModal(); }
+    return;
+  }
   if (t === "executor_report") { renderExecReport(ev.on); return; }
   if (t === "stopped") { setStatus(""); setBusy(false); note("[已中断]"); return; }
   if (t === "turn_end") { setStatus(""); setBusy(false); return; }
@@ -230,9 +266,53 @@ function renderUsageLine() {
 }
 
 /* ---------- Turn 结构构建 ---------- */
-function userBubble(text) {
-  const el = document.createElement("div"); el.className = "msg-user"; el.textContent = text;
+function userBubble(text, turnId) {
+  const el = document.createElement("div"); el.className = "msg-user";
+  const bubble = document.createElement("div"); bubble.className = "mu-bubble";
+  const body = document.createElement("div"); body.className = "mu-text"; body.textContent = text;
+  bubble.appendChild(body);
+  el.appendChild(bubble);
+  const undo = document.createElement("button");
+  undo.className = "undo-btn"; undo.textContent = "撤销此消息";
+  undo.title = "回到这条消息之前（只回滚指挥者对话，不动执行者与文件）";
+  undo.onclick = () => {
+    const turn = Number(el.dataset.turn || 0);
+    if (!turn) return;
+    send({type: "undo_message", session: state.current, turn});
+  };
+  el.appendChild(undo);
+  if (turnId != null) {
+    el.dataset.turn = String(turnId);
+  } else {
+    el.classList.add("pending-turn");
+    el.dataset.pendingText = text;
+  }
   stream().appendChild(el); scrollDown();
+}
+
+function pendingBubbles() {
+  return [...stream().querySelectorAll(".msg-user.pending-turn")];
+}
+
+function bindPendingTurn(turnId, batchText) {
+  const pendings = pendingBubbles();
+  const plan = pendingBindPlan(batchText, pendings.map((el) => el.dataset.pendingText || ""));
+  pendings.slice(0, plan.skip).forEach(dropPending);            // 被并入上一回合的：不再可撤
+  for (const el of pendings.slice(plan.skip, plan.skip + plan.bind)) {
+    el.dataset.turn = String(turnId);
+    el.classList.remove("pending-turn");
+    delete el.dataset.pendingText;
+  }
+}
+
+function dropPending(el) {
+  el.classList.remove("pending-turn");
+  delete el.dataset.pendingText;
+}
+
+function dropPendingTurns() {
+  // 会话切换/撤销后：兜底清掉所有未绑定标记（避免错绑）
+  for (const el of pendingBubbles()) dropPending(el);
 }
 
 function makeTurn(container) {
@@ -305,6 +385,39 @@ function renderMath(el) {
   } catch (e) { /* 渲染失败时保持原文展示 */ }
 }
 
+function renderDiffCard(container, summary) {
+  if (!summary.files.length) return;
+  let card = container.querySelector(":scope > .diff-card");
+  if (!card) {
+    card = document.createElement("div");
+    card.className = "diff-card";
+    container.appendChild(card);
+  }
+  card.innerHTML = "";
+  const head = document.createElement("div");
+  head.className = "dc-head";
+  const label = document.createElement("span");
+  label.textContent = summary.label;
+  const add = document.createElement("span");
+  add.className = "dc-add"; add.textContent = `+${summary.added}`;
+  const del = document.createElement("span");
+  del.className = "dc-del"; del.textContent = `-${summary.removed}`;
+  head.append(label, add, del);
+  card.appendChild(head);
+  for (const f of summary.files) {
+    const row = document.createElement("div");
+    row.className = "dc-row";
+    const path = document.createElement("span");
+    path.className = "dc-path"; path.textContent = f.path;
+    const a = document.createElement("span");
+    a.className = "dc-add"; a.textContent = `+${f.added}`;
+    const r = document.createElement("span");
+    r.className = "dc-del"; r.textContent = `-${f.removed}`;
+    row.append(path, a, r);
+    card.appendChild(row);
+  }
+}
+
 function reasoningDetails(container, label, beforeEl, extraClass = "") {
   const details = document.createElement("details");
   details.className = extraClass ? `thinking ${extraClass}` : "thinking";
@@ -354,11 +467,15 @@ function addWorkingText(body, text) {
   body.appendChild(el); scrollDown();
 }
 
-const TOOL_ICONS = {ls: "📁", read_file: "📖", grep: "🔍", glob: "🗂", write_file: "✏️", edit_file: "✏️", run_shell: "$", call_subagent: "➤", answer_task: "↩", ask: "?"};
+const TOOL_ICONS = {ls: "▤", read_file: "▤", grep: "⌕", glob: "⌕", write_file: "✎", edit_file: "✎", run_shell: "$", call_subagent: "➤", answer_task: "↩", ask: "?"};
+
+const ICON_FOLDER = '<svg class="ico ico-dir" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M1.8 4.1c0-.7.5-1.2 1.2-1.2h3l1.5 1.9h5.5c.7 0 1.2.5 1.2 1.2v6.4c0 .7-.5 1.2-1.2 1.2H3c-.7 0-1.2-.5-1.2-1.2z" fill="currentColor" fill-opacity=".18" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/></svg>';
+const ICON_FILE = '<svg class="ico ico-file" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M4 1.8h5.1l3 3v9.4H4z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/><path d="M9.1 1.8v3h3" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/></svg>';
+function fileIcon(isDir) { return isDir ? ICON_FOLDER : ICON_FILE; }
 function addToolRow(body, name, args) {
   const row = document.createElement("div"); row.className = "tool-row"; row.dataset.tool = `${name}:${args || ""}`;
   const argsText = compactArgs(name, args);
-  row.innerHTML = `<span class="t-icon">…</span><span class="t-name">${escapeHtml(TOOL_ICONS[name] || "🔧")} ${escapeHtml(displayToolName(name))}</span><span class="t-detail">${escapeHtml(argsText)}</span>`;
+  row.innerHTML = `<span class="t-icon">…</span><span class="t-name">${escapeHtml(TOOL_ICONS[name] || "▸")} ${escapeHtml(displayToolName(name))}</span><span class="t-detail">${escapeHtml(argsText)}</span>`;
   body.appendChild(row); scrollDown();
   return row;
 }
@@ -455,7 +572,17 @@ function routeExecution(ev) {
     execAppendLive(ev.task_id, "text", ev.text || "");
     return;
   }
+  if (t === "task_diff") {
+    const lt = state.turnsById[ev.turn_id];
+    if (lt) {
+      (lt.diffEvents = lt.diffEvents || []).push(ev);
+      renderDiffCard(lt.turn, diffSummary(lt.diffEvents));
+      scrollDown();
+    }
+    return;
+  }
   if (t === "turn_started") {
+    bindPendingTurn(ev.turn_id, ev.text);
     const turnEl = makeTurn();
     let shell = null;
     if (ev.text) shell = makeTurnShell(turnEl);
@@ -626,7 +753,7 @@ async function loadTimeline() {
 }
 
 function renderHistoryTurn(turn) {
-  if (turn.user_message) userBubble(turn.user_message);
+  if (turn.user_message) userBubble(turn.user_message, turn.id);
   const events = turn.events || [];
   const turnEl = makeTurn();
   if (hasWork(events)) {
@@ -705,6 +832,7 @@ function renderHistoryTurn(turn) {
     renderFinalText(finalEl.querySelector(".final-text"), turn.final_text);
     turnEl.appendChild(finalEl);
   }
+  renderDiffCard(turnEl, diffSummary(events));
 }
 
 /* ---------- Task inspector ---------- */
@@ -761,9 +889,18 @@ function renderTree() {
   for (const [pid, p] of Object.entries(state.projects)) {
     const pEl = document.createElement("div");
     const head = document.createElement("div"); head.className = "project-name";
-    head.innerHTML = `<span>📁 ${escapeHtml(p.name)}</span>`;
+    head.innerHTML = `<span class="project-label">${ICON_FOLDER}${escapeHtml(p.name)}</span>`;
     const add = document.createElement("button"); add.className = "add-session"; add.textContent = "+";
-    add.title = "新会话"; add.onclick = () => { state.wantNewSession = true; send({type: "new_session", project: pid, title: ""}); };
+    add.title = "新会话 / 导入"; add.onclick = (e) => {
+      e.stopPropagation();
+      openPopup(e.currentTarget, [
+        {label: "新会话", run: () => {
+          state.wantNewSession = true;
+          send({type: "new_session", project: pid, title: ""});
+        }},
+        {label: "导入 Codex 会话…", run: () => openImportModal(pid)},
+      ]);
+    };
     head.appendChild(add); pEl.appendChild(head);
     const sessions = Object.values(state.sessions).filter(s => s.project === pid);
     for (const s of sessions) {
@@ -864,7 +1001,7 @@ async function renderFiles(path = ".") {
     const name = isDir ? line.slice(0, -1) : line;
     const el = document.createElement("div");
     el.className = "fs-entry" + (isDir ? " dir" : " file");
-    el.textContent = (isDir ? "📁 " : "📄 ") + name;
+    el.innerHTML = fileIcon(isDir) + `<span class="fs-name">${escapeHtml(name)}</span>`;
     el.onclick = () => isDir
       ? renderFiles(path === "." ? name : `${path}/${name}`)
       : openFile(path === "." ? name : `${path}/${name}`);
@@ -910,6 +1047,286 @@ function confirmCard(ev) {
 
 /* ---------- 输入与命令 ---------- */
 let mainBusy = false;
+/* ---------- 通用弹出菜单 / 项目“+”菜单 / 导入 Codex ---------- */
+
+function closePopup() {
+  $("popup-menu").classList.add("hidden");
+}
+
+function openPopup(anchor, items) {
+  const menu = $("popup-menu");
+  menu.innerHTML = "";
+  for (const item of items) {
+    const btn = document.createElement("button");
+    btn.className = "mention-item command";
+    btn.textContent = item.label;
+    btn.onmousedown = (e) => { e.preventDefault(); closePopup(); item.run(); };
+    menu.appendChild(btn);
+  }
+  menu.classList.remove("hidden");
+  const box = anchor.getBoundingClientRect();
+  const height = menu.offsetHeight;
+  const boxEl = anchor.closest("#composer-box");
+  const upTo = boxEl ? boxEl.getBoundingClientRect().top : box.top;  // 上弹时对齐输入区顶边
+  const below = box.bottom + 6;
+  const top = below + height <= window.innerHeight - 8
+    ? below
+    : Math.max(8, upTo - height - 6);
+  menu.style.left = `${Math.max(8, Math.min(box.left, window.innerWidth - menu.offsetWidth - 8))}px`;
+  menu.style.top = `${top}px`;
+}
+
+function insertIntoComposer(text) {
+  const input = $("input");
+  input.value = text;
+  input.focus();
+  input.setSelectionRange(text.length, text.length);
+  input.dispatchEvent(new Event("input", {bubbles: true}));
+}
+
+$("btn-plus").onclick = (e) => {
+  e.stopPropagation();
+  openPopup(e.currentTarget, [
+    {label: "/ 命令（技能等）", run: () => insertIntoComposer("/")},
+    {label: "@ 上下文（文件/文件夹）", run: () => insertIntoComposer("@")},
+  ]);
+};
+
+let importProjectId = "";
+
+function openImportModal(projectId = "") {
+  importProjectId = projectId || (state.sessions[state.current] || {}).project || "";
+  importPending = false;
+  $("import-modal-mask").classList.remove("hidden");
+  $("import-result").textContent = "";
+  $("import-submit").disabled = false;
+  $("import-id").value = "";
+  $("import-id").focus();
+}
+
+function closeImportModal() {
+  $("import-modal-mask").classList.add("hidden");
+  importPending = false;
+  $("import-submit").disabled = false;
+}
+
+let importPending = false;
+
+function submitImport() {
+  const id = $("import-id").value.trim();
+  if (!id || importPending) return;              // 防重复提交
+  importPending = true;
+  $("import-submit").disabled = true;
+  $("import-result").textContent = "正在导入…";
+  send({type: "import_codex", session: state.current, project: importProjectId,
+        codex_session: id});
+}
+
+$("import-submit").onclick = submitImport;
+$("import-id").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") { e.preventDefault(); submitImport(); }
+});
+$("import-close").onclick = closeImportModal;
+$("import-cancel").onclick = closeImportModal;
+document.addEventListener("click", (e) => {
+  if (!e.target.closest("#popup-menu") && !e.target.closest("#btn-plus")
+      && !e.target.closest(".add-session")) {
+    closePopup();
+  }
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") closePopup();
+});
+
+/* ---------- 拖放文件 → 存进项目 → 插入 @路径 ---------- */
+
+async function uploadDropped(file, input) {
+  const pid = mentionProjectId();
+  if (!pid) {
+    note("[错误] 拖放失败：当前没有可用项目");
+    return;
+  }
+  let data = {};
+  try {
+    const resp = await fetch(
+      `/api/upload?project=${encodeURIComponent(pid)}`
+      + `&filename=${encodeURIComponent(file.name)}&token=${TOKEN}`,
+      {method: "POST", body: file});
+    data = await resp.json();
+  } catch (e) {
+    note(`[错误] 上传失败：${e}`);
+    return;
+  }
+  if (!data.path) {
+    note(`[错误] 上传失败：${data.error || "未知错误"}`);
+    return;
+  }
+  const text = input.value;
+  const pad = text && !/\s$/.test(text) ? " " : "";
+  input.value = `${text}${pad}@${data.path} `;
+  input.focus();
+  input.setSelectionRange(input.value.length, input.value.length);
+}
+
+function attachDropTarget(box, input) {
+  box.addEventListener("dragover", (e) => { e.preventDefault(); box.classList.add("drop-target"); });
+  box.addEventListener("dragleave", () => box.classList.remove("drop-target"));
+  box.addEventListener("drop", async (e) => {
+    e.preventDefault();
+    box.classList.remove("drop-target");
+    const files = [...((e.dataTransfer && e.dataTransfer.files) || [])];
+    for (const file of files) await uploadDropped(file, input);
+  });
+}
+
+attachDropTarget($("composer-box"), $("input"));
+attachDropTarget($("exec-box"), $("exec-input"));
+
+/* ---------- @ 提及（只插路径，内容让模型自己读） ---------- */
+
+const mention = { input: null, range: null, items: [], active: 0, token: 0, mode: "mention" };
+let skillsCache = { project: null, skills: [] };
+
+async function loadSkills(pid) {
+  if (skillsCache.project === pid) return skillsCache.skills;
+  try {
+    const data = await api(`/api/skills?project=${encodeURIComponent(pid)}`);
+    skillsCache = {project: pid, skills: data.skills || []};
+  } catch (e) {
+    skillsCache = {project: pid, skills: []};
+  }
+  return skillsCache.skills;
+}
+
+function mentionProjectId() {
+  const cur = state.sessions[state.current];
+  return (cur && cur.project) || Object.keys(state.projects)[0] || "";
+}
+
+function hideMention() {
+  $("mention-menu").classList.add("hidden");
+  mention.input = null;
+  mention.range = null;
+  mention.items = [];
+}
+
+function placeMention(input) {
+  const menu = $("mention-menu");
+  const box = input.getBoundingClientRect();
+  menu.style.left = `${Math.max(8, box.left)}px`;
+  menu.style.top = `${Math.max(8, box.top - menu.offsetHeight - 8)}px`;
+}
+
+function acceptMention(index) {
+  const input = mention.input, range = mention.range;
+  const item = mention.items[index];
+  if (!input || !range || !item) return;
+  const src = input.value;
+  const end = range.end ?? src.length;
+  const folder = mention.mode === "mention" && String(item.insert).endsWith("/");
+  const res = mention.mode === "command"
+    ? {text: src.slice(0, range.start) + item.insert + src.slice(end),
+       caret: range.start + item.insert.length}
+    : insertMention(src, range.start, end, item.insert);
+  input.value = res.text;
+  input.setSelectionRange(res.caret, res.caret);
+  input.focus();
+  if (folder) {
+    updateMention(input);          // 选文件夹后继续展开，便于层层进入
+  } else {
+    hideMention();
+  }
+}
+
+async function updateMention(input) {
+  const pos = input.selectionStart ?? input.value.length;
+  const pid = mentionProjectId();
+  if (!pid) { hideMention(); return; }
+
+  const cmd = commandQuery(input.value, pos);
+  if (cmd) {
+    mention.input = input;
+    mention.range = {start: cmd.start, end: pos};
+    mention.mode = "command";
+    const token = ++mention.token;
+    const skills = await loadSkills(pid);
+    if (token !== mention.token || mention.input !== input) return;
+    const builtins = [
+      {label: "/skills — 列出可用技能", insert: "/skills"},
+    ];
+    const items = [
+      ...skills.map((s) => ({
+        label: `/skill ${s.name} — ${s.description || "（无描述）"}`,
+        insert: `/skill ${s.name} `,
+      })),
+      ...builtins,
+    ].filter((it) => it.insert.startsWith(cmd.query));
+    renderSuggestMenu(items);
+    return;
+  }
+
+  const m = mentionQuery(input.value, pos);
+  if (!m) { hideMention(); return; }
+  mention.input = input;
+  mention.range = {start: m.start, end: pos};
+  mention.mode = "mention";
+  const token = ++mention.token;
+  try {
+    const data = await api(`/api/files?project=${encodeURIComponent(pid)}`
+                           + `&q=${encodeURIComponent(m.query)}&limit=50`);
+    if (token !== mention.token || mention.input !== input) return;   // 丢弃过期响应
+    renderSuggestMenu((data.paths || []).map((p) => ({label: p, insert: p})));
+  } catch (e) { hideMention(); }
+}
+
+function renderSuggestMenu(items) {
+  const menu = $("mention-menu");
+  menu.innerHTML = "";
+  mention.items = (items || []).slice(0, 50);
+  mention.active = 0;
+  if (!mention.items.length) { hideMention(); return; }
+  mention.items.forEach((item, i) => {
+    const btn = document.createElement("button");
+    btn.className = "mention-item" + (i === 0 ? " active" : "") + (mention.mode === "command" ? " command" : "");
+    btn.textContent = item.label;
+    btn.onmousedown = (e) => { e.preventDefault(); acceptMention(i); };
+    menu.appendChild(btn);
+  });
+  menu.classList.remove("hidden");
+  placeMention(mention.input);
+}
+
+function mentionKeydown(e) {
+  const menu = $("mention-menu");
+  if (menu.classList.contains("hidden")) return false;
+  if (!mention.items.length) return false;
+  if (e.key === "ArrowDown") {
+    mention.active = (mention.active + 1) % mention.items.length; e.preventDefault();
+  } else if (e.key === "ArrowUp") {
+    mention.active = (mention.active - 1 + mention.items.length) % mention.items.length;
+    e.preventDefault();
+  } else if (e.key === "Enter" || e.key === "Tab") {
+    acceptMention(mention.active); e.preventDefault(); e.stopPropagation(); return true;
+  } else if (e.key === "Escape") {
+    e.preventDefault(); hideMention(); return true;
+  } else {
+    return false;
+  }
+  document.querySelectorAll("#mention-menu .mention-item").forEach((el, i) => {
+    el.classList.toggle("active", i === mention.active);
+  });
+  return true;
+}
+
+for (const input of [$("input"), $("exec-input")]) {
+  input.addEventListener("input", () => updateMention(input));
+  input.addEventListener("keydown", (e) => { mentionKeydown(e); }, true);
+  input.addEventListener("blur", () => setTimeout(hideMention, 150));
+}
+document.addEventListener("click", (e) => {
+  if (!e.target.closest("#mention-menu")) hideMention();
+});
+
 function setBusy(on) {
   mainBusy = on;
   const btn = $("btn-send");
@@ -977,6 +1394,7 @@ function renderProviders() {
   for (const row of rows) {
     const el = document.createElement("div");
     el.className = "provider-row";
+    if (row.hint) el.title = row.hint;
     const name = document.createElement("span");
     name.className = "provider-name"; name.textContent = row.label;
     const stateEl = document.createElement("span");
@@ -985,6 +1403,32 @@ function renderProviders() {
     const actions = document.createElement("span");
     actions.className = "provider-actions";
     const btn = document.createElement("button");
+    if (row.kind === "preset" && row.login) {
+      stateEl.textContent = row.loggedIn ? "已登录 ChatGPT" : "未登录 ChatGPT";
+      stateEl.classList.toggle("ok", row.loggedIn);
+      if (!row.loggedIn) {
+        btn.textContent = "登录";
+        btn.onclick = () => send({type: "codex_login"});
+        actions.appendChild(btn);
+      } else {
+        btn.textContent = "刷新";
+        btn.onclick = () => send({type: "list_models", provider: row.providerId, refresh: true});
+        actions.appendChild(btn);
+        const quit = document.createElement("button");
+        quit.textContent = "退出登录";
+        quit.onclick = () => send({type: "codex_logout"});
+        actions.appendChild(quit);
+      }
+      el.append(name, stateEl, actions);
+      box.appendChild(el);
+      if (row.hint) {
+        const tip = document.createElement("div");
+        tip.className = "hint provider-hint";
+        tip.textContent = row.hint;
+        box.appendChild(tip);
+      }
+      continue;
+    }
     if (row.configured) {
       btn.textContent = "刷新";
       btn.onclick = () => send({type: "list_models", provider: row.providerId, refresh: true});
@@ -1050,7 +1494,6 @@ $("key-input").addEventListener("keydown", (e) => {
   if (e.key === "Enter") { e.preventDefault(); $("key-submit").click(); }
 });
 $("key-close").onclick = () => closeKeyModal();
-$("key-back").onclick = () => closeKeyModal();
 
 function fillEffortSelect(sel, role, st) {
   sel.innerHTML = "";
@@ -1423,7 +1866,7 @@ async function browseDir(path) {
   list.appendChild(parent);
   for (const d of data.dirs) {
     const el = document.createElement("div");
-    el.className = "dir-item"; el.textContent = "📁 " + d;
+    el.className = "dir-item"; el.innerHTML = ICON_FOLDER + escapeHtml(d);
     el.onclick = () => browseDir(data.path + "/" + d);
     list.appendChild(el);
   }
@@ -1641,7 +2084,7 @@ function renderExecutorMessages(messages, inflight) {
     for (const call of m.calls) {
       const row = document.createElement("div");
       row.className = "exec-msg-tool";
-      row.textContent = `🔧 ${call.name} ${JSON.stringify(call.arguments).slice(0, 120)}`;
+      row.textContent = `▸ ${call.name} ${JSON.stringify(call.arguments).slice(0, 120)}`;
       el.appendChild(row);
     }
     renderMath(el);
@@ -1740,7 +2183,7 @@ function renderExecutorInflight(inflight) {
     for (const call of m.calls) {
       const row = document.createElement("div");
       row.className = "exec-msg-tool";
-      row.textContent = `🔧 ${call.name} ${JSON.stringify(call.arguments).slice(0, 120)}`;
+      row.textContent = `▸ ${call.name} ${JSON.stringify(call.arguments).slice(0, 120)}`;
       el.appendChild(row);
     }
     renderMath(el);

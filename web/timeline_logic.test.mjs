@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  pendingBindPlan,
   breadcrumb,
   composerLayout,
   executorMessageView,
@@ -42,8 +43,12 @@ import {
   routeActionEvent,
   sessionLabel,
   shouldDropShell,
+  commandQuery,
+  diffSummary,
   extractMath,
+  insertMention,
   liveBufferStale,
+  mentionQuery,
   shouldStickToBottom,
   subagentTaskCount,
   taskCardAction,
@@ -844,4 +849,63 @@ test("公式提取：四种分隔符 + 代码段保护 + 单 $ 防误伤", () =>
   const multiAfterCode = extractMath("    $$x$$\n$$\nE=mc^2\n$$");
   assert.equal(multiAfterCode.items.length, 1);       // 代码块跳过、跨行公式仍提取
   assert.equal(multiAfterCode.items[0].tex, "E=mc^2");
+});
+
+test("改动汇总：累计 task_diff、忽略其它事件与坏 JSON、按路径排序", () => {
+  const events = [
+    {type: "task_diff", text: JSON.stringify({files: [{path: "b.js", added: 2, removed: 1}]})},
+    {type: "tool_started", name: "read_file"},
+    {type: "task_diff", text: "not json"},
+    {type: "task_diff", text: JSON.stringify({files: [
+      {path: "a.js", added: 3, removed: 0},
+      {path: "b.js", added: 1, removed: 4},
+    ]})},
+  ];
+  const s = diffSummary(events);
+  assert.equal(s.label, "2 个文件已更改");
+  assert.equal(s.added, 6);
+  assert.equal(s.removed, 5);
+  assert.deepEqual(s.files.map((f) => f.path), ["a.js", "b.js"]);
+  assert.deepEqual(s.files[1], {path: "b.js", added: 3, removed: 5});
+  assert.equal(diffSummary([]).label, "");
+});
+
+test("@提及：触发条件、光标定位与插入", () => {
+  assert.deepEqual(mentionQuery("看看 @app", 8), {start: 3, query: "app"});
+  assert.deepEqual(mentionQuery("@a", 2), {start: 0, query: "a"});
+  assert.deepEqual(mentionQuery("x@y", 3), null);          // 词中 @ 不触发
+  assert.deepEqual(mentionQuery("看看 @app 再说", 12), null); // 片段已结束
+  assert.deepEqual(mentionQuery("看看 @src/ma", 11), {start: 3, query: "src/ma"});
+
+  assert.deepEqual(insertMention("看看 @app", 3, 7, "web/app.js"),
+                   {text: "看看 @web/app.js", caret: 14});
+  assert.deepEqual(insertMention("@a b", 0, 2, "a.txt"),
+                   {text: "@a.txt b", caret: 6});              // 原有空格不重复补
+  assert.deepEqual(insertMention("@a(x)", 0, 2, "a.txt"),
+                   {text: "@a.txt (x)", caret: 7});            // 括号前补空格
+});
+
+test("/命令：触发条件与片段", () => {
+  assert.deepEqual(commandQuery("/ski", 4), {start: 0, query: "/ski"});
+  assert.deepEqual(commandQuery("你好 /skill", 10), {start: 3, query: "/skill"});
+  assert.deepEqual(commandQuery("看看 /a", 6), {start: 3, query: "/a"});
+  assert.deepEqual(commandQuery("/skill demo", 11), null);   // 参数开始后不再匹配
+  assert.deepEqual(commandQuery("a/b", 3), null);            // 词中斜杠不触发
+});
+
+test("待绑定气泡：前缀匹配、合并消息、被并入的旧消息跳过", () => {
+  assert.deepEqual(pendingBindPlan("第一问", ["第一问"]), {skip: 0, bind: 1});
+  assert.deepEqual(pendingBindPlan("第一问\n第二问", ["第一问", "第二问"]), {skip: 0, bind: 2});
+  // 批次以非气泡文本开头（如 /skill 注入的提示）时：为保证行边界防碰撞，本批不绑定
+  assert.deepEqual(pendingBindPlan("说话\n第一问\n第二问", ["第一问", "第二问"]),
+                   {skip: 2, bind: 0});
+  // 一条被并入上一回合的旧消息（不在本回合文本里）：跳过它，绑定后面的
+  assert.deepEqual(pendingBindPlan("第三问", ["第二问", "第三问"]), {skip: 1, bind: 1});
+  assert.deepEqual(pendingBindPlan("新话", ["旧话"]), {skip: 1, bind: 0});
+  assert.deepEqual(pendingBindPlan("", ["第一问"]), {skip: 1, bind: 0});   // 合成回合
+  assert.deepEqual(pendingBindPlan("第一问", []), {skip: 0, bind: 0});
+  // 前缀碰撞：旧消息是本次新消息的前缀时，旧气泡不能被误绑（行边界锚定）
+  assert.deepEqual(pendingBindPlan("继续做这件事", ["继续", "继续做这件事"]),
+                   {skip: 1, bind: 1});
+  assert.deepEqual(pendingBindPlan("测试", ["测试一下这个功能"]), {skip: 1, bind: 0});
 });

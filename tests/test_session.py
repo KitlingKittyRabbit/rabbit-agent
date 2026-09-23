@@ -202,3 +202,76 @@ def test_reconcile_stale_tasks(tmp_path: Path) -> None:
         assert store.get_task("s1", 3)["status"] == "done"
     finally:
         store.close()
+
+
+def test_undo_from_deletes_turn_events_tasks_and_truncates(tmp_path: Path) -> None:
+    """回滚：删该回合及其后的回合/事件/任务，并给出消息边界。"""
+    from agent.providers import Message
+
+    store = SessionStore(tmp_path / "s.db")
+    try:
+        store.create_session("s1", "", "t")
+        t1 = store.create_turn("s1", "第一问", "completed", msg_count=0)
+        store.finish_turn(t1, "completed", "第一答")
+        store.append("s1", [Message(role="user", content="第一问"),
+                            Message(role="assistant", content="第一答")])
+        t2 = store.create_turn("s1", "第二问", "completed", msg_count=2)
+        store.finish_turn(t2, "completed", "第二答")
+        store.append("s1", [Message(role="user", content="第二问"),
+                            Message(role="assistant", content="第二答")])
+        store.add_event("s1", "turn_started", 1.0, turn_id=t2)
+        store.create_task(1, "s1", t2, "标题", "提示", "m", "prov", "done")
+        store.add_event("s1", "subagent_completed", 1.0, turn_id=t2, task_id=1)
+
+        info = store.undo_from("s1", t2)
+        assert info is not None
+        assert info["user_message"] == "第二问" and info["msg_count"] == 2
+        assert info["deleted_turns"] == 1 and info["deleted_tasks"] == 1
+        assert [t["id"] for t in store.list_turns("s1")] == [t1]
+        assert store.list_events("s1") == []
+        assert store.list_tasks("s1") == []
+
+        assert store.truncate_messages("s1", info["msg_count"]) == 2
+        assert [m.content for m in store.load("s1")] == ["第一问", "第一答"]
+        assert store.undo_from("s1", 99999) is None          # 不存在的消息
+    finally:
+        store.close()
+
+
+def test_undo_refuses_legacy_turns_without_boundary(tmp_path: Path) -> None:
+    """旧库回合没有消息边界（msg_count=0 且非首条）：拒绝撤销且不删任何数据。"""
+    store = SessionStore(tmp_path / "s.db")
+    try:
+        store.create_session("s1", "", "t")
+        t1 = store.create_turn("s1", "旧一", "completed")          # 旧数据：msg_count=0
+        t2 = store.create_turn("s1", "旧二", "completed")
+        store.append("s1", [Message(role="user", content="旧一"),
+                            Message(role="assistant", content="答一")])
+
+        info = store.undo_from("s1", t2)
+        assert info is not None and info["unsupported"] is True
+        assert info["deleted_turns"] == 0
+        assert [t["id"] for t in store.list_turns("s1")] == [t1, t2]   # 什么都没删
+        assert len(store.load("s1")) == 2
+
+        first = store.undo_from("s1", t1)                          # 首条允许（边界 0 正确）
+        assert first["unsupported"] is False
+        assert store.list_turns("s1") == []
+    finally:
+        store.close()
+
+
+def test_turn_undoable_states(tmp_path: Path) -> None:
+    """预检三态：None=不存在；False=旧数据缺边界（非首条且 msg_count=0）；True=可撤。"""
+    store = SessionStore(tmp_path / "s.db")
+    try:
+        store.create_session("s1", "", "t")
+        legacy1 = store.create_turn("s1", "旧一", "completed")                 # 首条：允许
+        legacy2 = store.create_turn("s1", "旧二", "completed")                 # 非首条：拒绝
+        fresh = store.create_turn("s1", "新一", "completed", msg_count=2)      # 有边界：允许
+        assert store.turn_undoable("s1", 99999) is None
+        assert store.turn_undoable("s1", legacy1) is True
+        assert store.turn_undoable("s1", legacy2) is False
+        assert store.turn_undoable("s1", fresh) is True
+    finally:
+        store.close()

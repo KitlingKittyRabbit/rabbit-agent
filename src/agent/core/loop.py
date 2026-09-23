@@ -55,6 +55,7 @@ class AgentLoop:
         on_llm_call: Callable[[Usage], None] | None = None,
         max_context_tokens: int | None = None,
         no_progress_limit: int = 3,
+        session_id: str | None = None,
     ) -> None:
         self._provider = provider
         self._tools = tools
@@ -67,11 +68,14 @@ class AgentLoop:
         self._on_llm_call = on_llm_call
         self._max_context_tokens = max_context_tokens
         self._no_progress_limit = max(2, no_progress_limit)
+        self._session_id = session_id
         try:
             params = inspect.signature(provider.chat).parameters
             self._accepts_reasoning = "on_reasoning" in params
+            self._accepts_session = "session_id" in params
         except (TypeError, ValueError):
             self._accepts_reasoning = False
+            self._accepts_session = False
 
     async def run(
         self,
@@ -156,8 +160,17 @@ class AgentLoop:
                 await self._compactor(messages)
             try:
                 if self._accepts_reasoning:
+                    if self._accepts_session:
+                        return await self._provider.chat(
+                            messages, specs or None, on_text, self._on_reasoning,
+                            session_id=self._session_id,
+                        )
                     return await self._provider.chat(
                         messages, specs or None, on_text, self._on_reasoning
+                    )
+                if self._accepts_session:
+                    return await self._provider.chat(
+                        messages, specs or None, on_text, session_id=self._session_id,
                     )
                 return await self._provider.chat(messages, specs or None, on_text)
             except ContextOverflowError:

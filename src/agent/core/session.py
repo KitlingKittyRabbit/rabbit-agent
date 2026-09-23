@@ -35,7 +35,8 @@ CREATE TABLE IF NOT EXISTS turns (
     created_at REAL NOT NULL,
     started_at REAL,
     completed_at REAL,
-    final_text TEXT NOT NULL DEFAULT ''
+    final_text TEXT NOT NULL DEFAULT '',
+    msg_count INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS task_runs (
     id INTEGER NOT NULL,
@@ -96,6 +97,10 @@ def _migrate(conn: sqlite3.Connection) -> None:
     if s_cols and "project_id" not in s_cols:
         conn.execute("DROP TABLE sessions")
         conn.execute("DROP TABLE IF EXISTS messages")
+    # turns.msg_count：回滚用的消息边界（该回合开始前的 messages 条数）
+    turn_cols = [row[1] for row in conn.execute("PRAGMA table_info(turns)").fetchall()]
+    if turn_cols and "msg_count" not in turn_cols:
+        conn.execute("ALTER TABLE turns ADD COLUMN msg_count INTEGER NOT NULL DEFAULT 0")
     # task_runs 进度列：向后兼容补列，不动已有数据
     t_cols = [row[1] for row in conn.execute("PRAGMA table_info(task_runs)").fetchall()]
     if t_cols:
@@ -145,12 +150,13 @@ class SessionStore:
         self._conn.commit()
 
     # ---- Turns ----
-    def create_turn(self, session_id: str, user_message: str, status: str) -> int:
+    def create_turn(self, session_id: str, user_message: str, status: str,
+                    msg_count: int = 0) -> int:
         now = time.time()
         cur = self._conn.execute(
-            "INSERT INTO turns (session_id, user_message, status, created_at, started_at)"
-            " VALUES (?, ?, ?, ?, ?)",
-            (session_id, user_message, status, now, now),
+            "INSERT INTO turns (session_id, user_message, status, created_at, started_at,"
+            " msg_count) VALUES (?, ?, ?, ?, ?, ?)",
+            (session_id, user_message, status, now, now, max(0, int(msg_count))),
         )
         self._conn.commit()
         return cur.lastrowid
@@ -164,8 +170,8 @@ class SessionStore:
 
     def list_turns(self, session_id: str) -> list[dict]:
         rows = self._conn.execute(
-            "SELECT id, user_message, status, created_at, started_at, completed_at, final_text"
-            " FROM turns WHERE session_id = ? ORDER BY id",
+            "SELECT id, user_message, status, created_at, started_at, completed_at,"
+            " final_text, msg_count FROM turns WHERE session_id = ? ORDER BY id",
             (session_id,),
         ).fetchall()
         return [
@@ -177,9 +183,79 @@ class SessionStore:
                 "started_at": r[4],
                 "completed_at": r[5],
                 "final_text": r[6],
+                "msg_count": r[7],
             }
             for r in rows
         ]
+
+    def undo_from(self, session_id: str, turn_id: int) -> dict | None:
+        """回滚到某条消息之前：删该回合及其后的回合/事件/任务，返回原消息与边界。"""
+        row = self._conn.execute(
+            "SELECT id, user_message, msg_count FROM turns WHERE session_id = ? AND id = ?",
+            (session_id, turn_id),
+        ).fetchone()
+        if row is None:
+            return None
+        first_id = self._conn.execute(
+            "SELECT MIN(id) FROM turns WHERE session_id = ?", (session_id,)
+        ).fetchone()[0]
+        if int(row[2] or 0) <= 0 and int(row[0]) != int(first_id or -1):
+            # 旧库/导入的回合没有消息边界记录：撤了会清空整条历史，拒绝
+            return {"turn": int(row[0]), "user_message": str(row[1] or ""), "msg_count": 0,
+                    "unsupported": True, "deleted_turns": 0, "deleted_events": 0,
+                    "deleted_tasks": 0}
+        deleted_turns = self._conn.execute(
+            "DELETE FROM turns WHERE session_id = ? AND id >= ?", (session_id, turn_id)
+        ).rowcount
+        deleted_events = self._conn.execute(
+            "DELETE FROM execution_events WHERE session_id = ? AND turn_id >= ?",
+            (session_id, turn_id),
+        ).rowcount
+        deleted_tasks = self._conn.execute(
+            "DELETE FROM task_runs WHERE session_id = ? AND parent_turn_id >= ?",
+            (session_id, turn_id),
+        ).rowcount
+        self._conn.commit()
+        return {
+            "turn": int(row[0]), "user_message": str(row[1] or ""),
+            "msg_count": int(row[2] or 0), "unsupported": False,
+            "deleted_turns": deleted_turns,
+            "deleted_events": deleted_events, "deleted_tasks": deleted_tasks,
+        }
+
+    def turn_undoable(self, session_id: str, turn_id: int) -> bool | None:
+        """该消息是否可撤销：None=不存在；False=旧数据缺边界；True=可撤。"""
+        row = self._conn.execute(
+            "SELECT id, msg_count FROM turns WHERE session_id = ? AND id = ?",
+            (session_id, turn_id),
+        ).fetchone()
+        if row is None:
+            return None
+        if int(row[1] or 0) > 0:
+            return True
+        first_id = self._conn.execute(
+            "SELECT MIN(id) FROM turns WHERE session_id = ?", (session_id,)
+        ).fetchone()[0]
+        return int(row[0]) == int(first_id or -1)
+
+    def truncate_messages(self, session_id: str, keep: int, stream: str = "main") -> int:
+        """只保留该流最早的 keep 条消息（回滚用），返回删除条数。"""
+        idxs = [r[0] for r in self._conn.execute(
+            "SELECT idx FROM messages WHERE session_id = ? AND stream = ? ORDER BY idx",
+            (session_id, stream),
+        ).fetchall()]
+        keep = max(0, int(keep))
+        if keep >= len(idxs):
+            return 0
+        if keep == 0:
+            cur = self._conn.execute(
+                "DELETE FROM messages WHERE session_id = ? AND stream = ?", (session_id, stream))
+        else:
+            cur = self._conn.execute(
+                "DELETE FROM messages WHERE session_id = ? AND stream = ? AND idx > ?",
+                (session_id, stream, idxs[keep - 1]))
+        self._conn.commit()
+        return cur.rowcount
 
     # ---- TaskRuns ----
     def max_task_id(self, session_id: str) -> int:

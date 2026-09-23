@@ -121,3 +121,31 @@ def test_fetch_models_failures_raise_not_fake() -> None:
         asyncio.run(fetch_models("openai", "http://x", "k", client=empty))
     with pytest.raises(ModelListingUnsupported):
         asyncio.run(fetch_models("bogus", "http://x", "k", client=_Client(_Resp(payload={}))))
+
+
+async def test_listing_sends_opencode_session_headers() -> None:
+    """OpenCode 主机的 /models 也要带 UA + x-opencode-session；其它主机不带。"""
+    import httpx2
+
+    from agent.providers.listing import fetch_models
+
+    seen: dict = {}
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        seen["ua"] = request.headers.get("user-agent")
+        seen["sid"] = request.headers.get("x-opencode-session")
+        return httpx2.Response(200, json={"data": [{"id": "m1"}]})
+
+    client = httpx2.AsyncClient(transport=httpx2.MockTransport(handler))
+    models = await fetch_models("openai", "https://opencode.ai/zen/go/v1", "sk",
+                                client=client, session_id="sess-list")
+    assert models and models[0]["id"] == "m1"
+    assert seen["sid"] == "sess-list"
+    assert seen["ua"] and "rabbit-agent" in seen["ua"]
+
+    seen.clear()
+    client2 = httpx2.AsyncClient(transport=httpx2.MockTransport(handler))
+    await fetch_models("openai", "https://api.deepseek.com/v1", "sk", client=client2)
+    assert seen["sid"] is None
+    await client.aclose()
+    await client2.aclose()
