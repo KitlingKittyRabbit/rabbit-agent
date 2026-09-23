@@ -9,6 +9,7 @@ dependencies = [
     "fastapi>=0.115",
     "httpx2>=2.12",
     "uvicorn[standard]>=0.30",
+    "keyring>=25",
     "websockets>=13",
 ]
 

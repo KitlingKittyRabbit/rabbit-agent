@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -15,6 +16,7 @@ from pathlib import Path
 from ..providers import Message
 from ..tools import build_registry
 from .context import compact_messages
+from .diff_stats import accrue, diff_payload, file_change
 from .dispatch import ExecutorUnconfigured, TaskIncomplete
 from .events import (
     ACTOR_SUBAGENT,
@@ -24,6 +26,7 @@ from .events import (
     SUBAGENT_TEXT_DELTA,
     SUBAGENT_TOOL_FINISHED,
     SUBAGENT_TOOL_STARTED,
+    TASK_DIFF,
     TASK_RUNNING,
     _classify_status,
     _preview,
@@ -148,6 +151,7 @@ class ExecutorSession:
             messages, provider=registry.executor_provider,
             budget_tokens=budget["compact_at"], tool_specs=self._tools.specs(),
             on_compacted=None, usage=None, preserve=self._inflight_anchor,
+            session_id=self.id,
         )
 
     def spawn(
@@ -174,6 +178,15 @@ class ExecutorSession:
         record = self._record_event
         partial_text: list[str] = []       # 当前模型回合已流出的文本（每轮清空）
         partial_reasoning: list[str] = []  # 当前模型回合已流出的思考
+        task_diff: dict[str, list[int]] = {}   # path -> [added, removed]（写/编辑工具）
+
+        def record_diff() -> None:
+            payload = diff_payload(task_diff)
+            if payload is None:
+                return
+            task_diff.clear()
+            record(TASK_DIFF, actor=ACTOR_SUBAGENT, task_id=task_id, turn_id=turn,
+                   text=json.dumps(payload, ensure_ascii=False))
 
         def on_text(text: str) -> None:
             partial_text.append(text)
@@ -181,6 +194,11 @@ class ExecutorSession:
                    turn_id=turn, text=text)
 
         def on_tool(call, payload: str | None, phase: str) -> None:
+            if phase == "finished" and not (payload or "").startswith("错误"):
+                # call_safe 把失败也回成 finished（文本以「错误」开头）：失败不计改动
+                change = file_change(call.name, call.arguments)
+                if change is not None:
+                    accrue(task_diff, change)
             if phase == "started":
                 if store is not None:
                     # 最近动作属 actions 维度；步数（模型回合）由 on_step 单独维护
@@ -229,6 +247,7 @@ class ExecutorSession:
             loop = AgentLoop(
                 registry.executor_provider,
                 tools,
+                session_id=self.id,
                 max_steps=registry.max_steps_executor,
                 compactor=self._compact,
                 on_tool_event=on_tool,
@@ -243,6 +262,7 @@ class ExecutorSession:
                 )
                 raise
             finally:
+                record_diff()          # 成功/失败/中断都汇总已产生的文件改动
                 self._working = None
                 self._inflight_anchor = None
             # 压缩/截断可能已改写 working：整段替换（去掉 system），持久化同步整段重写

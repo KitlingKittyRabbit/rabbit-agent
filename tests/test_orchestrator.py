@@ -85,6 +85,10 @@ async def test_full_closed_loop(tmp_path: Path) -> None:
     system = main.calls[0][0][0]
     assert system.role == "system"
     assert "先批后落盘" in system.content
+    assert "派发时把项目纪律中与执行者操作相关的约束写进提示词" in system.content
+    executor_system = executor.calls[0][0][0]
+    assert executor_system.role == "system"
+    assert "先批后落盘" not in executor_system.content  # 纪律不整份塞给执行者
     executor_tool_names = [t.name for t in executor.calls[0][1]]
     assert "write_file" in executor_tool_names
     assert "run_shell" in executor_tool_names
@@ -928,3 +932,328 @@ async def test_conversation_compact_uses_turn_anchor(tmp_path: Path) -> None:
     assert any("本回合指令" in m.content for m in working)     # 锚点未被吞
     assert any("前情摘要" in m.content for m in working)       # 旧历史被压缩
     assert any("任务 #1 完成" in m.content for m in working)
+
+
+async def test_compaction_passes_session_id_when_supported() -> None:
+    """压缩请求也算该会话流量：provider 接受 session_id 时必须透传（Go 网关要求）。"""
+    from agent.core.context import compact_messages
+
+    class SessionRecorder(FakeProvider):
+        def __init__(self, script):
+            super().__init__(script)
+            self.sessions: list = []
+
+        async def chat(self, messages, tools=None, on_text=None, on_reasoning=None,
+                       session_id=None):
+            self.sessions.append(session_id)
+            return await super().chat(messages, tools, on_text, on_reasoning)
+
+    recorder = SessionRecorder([ChatResult(text="摘要")])
+    messages = [
+        Message(role="system", content="sys"),
+        Message(role="user", content="旧" + "长" * 100),
+        Message(role="assistant", content="回复"),
+        Message(role="user", content="当前任务" + "长" * 4000),
+    ]
+    ok = await compact_messages(messages, provider=recorder, budget_tokens=100,
+                                tool_specs=[], session_id="sess-compact")
+    assert ok is True
+    assert recorder.sessions == ["sess-compact"]
+
+
+async def test_skill_command_injects_and_lists(tmp_path: Path) -> None:
+    """`/skill <名称>` 把 SKILL.md 注入本轮（仅指挥者）；`/skills` 列出；未知技能报错。"""
+    from agent.core.orchestrator import Orchestrator
+    from agent.core.session import SessionStore
+
+    skill_dir = tmp_path / ".agent" / "skills" / "demo"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("---\ndescription: 演示技能\n---\n先读 AGENTS.md\n再动手",
+                                        encoding="utf-8")
+    main = FakeProvider([ChatResult(text="好")])
+    orch = Orchestrator(main_provider=main,
+                        executor_provider=FakeProvider([ChatResult(text="x")]),
+                        root=tmp_path, store=SessionStore(tmp_path / "s.db"))
+    conv = orch.conversations[next(iter(orch.conversations))]
+    queue = orch.subscribe()
+    await orch.start()
+    try:
+        orch.handle_client_message(
+            {"type": "user", "session": conv.id, "text": "/skills"})
+        notice = await _until(queue, lambda e: e.get("type") == "notice")
+        assert "demo" in notice["message"] and "演示技能" in notice["message"]
+
+        orch.handle_client_message(
+            {"type": "user", "session": conv.id, "text": "/skill demo 只做一半"})
+        await _until(queue, lambda e: e.get("type") == "turn_completed")
+        sent = "\n".join(m.content for m in main.calls[-1][0])
+        assert "[技能 demo]" in sent and "先读 AGENTS.md" in sent and "只做一半" in sent
+
+        orch.handle_client_message(
+            {"type": "user", "session": conv.id, "text": "/skill nope"})
+        err = await _until(queue, lambda e: e.get("type") == "error")
+        assert "未找到技能" in err["message"]
+    finally:
+        await orch.stop()
+
+
+async def test_import_codex_message(tmp_path: Path, monkeypatch) -> None:
+    """import_codex 消息：导入成新会话并 focus；未知 id 报错。"""
+    import json
+
+    import agent.core.codex_import as codex
+    from agent.core.orchestrator import Orchestrator
+    from agent.core.session import SessionStore
+
+    day = tmp_path / "codex" / "2026" / "09" / "21"
+    day.mkdir(parents=True)
+    sid = "01a034c4-db7a-7e70-92c6-8fb5993e03dc"
+    rows = [
+        {"type": "response_item", "payload": {"type": "message", "role": "user",
+                                              "content": [{"type": "input_text",
+                                                           "text": "导入的问题"}]}},
+        {"type": "response_item", "payload": {"type": "message", "role": "assistant",
+                                              "content": [{"type": "output_text",
+                                                           "text": "导入的回答"}]}},
+    ]
+    (day / f"rollout-2026-09-21T10-00-00-{sid}.jsonl").write_text(
+        "\n".join(json.dumps(r, ensure_ascii=False) for r in rows), encoding="utf-8")
+    monkeypatch.setattr(codex, "sessions_dir", lambda: tmp_path / "codex")
+
+    orch = Orchestrator(main_provider=FakeProvider([ChatResult(text="x")]),
+                        executor_provider=FakeProvider([ChatResult(text="x")]),
+                        root=tmp_path, store=SessionStore(tmp_path / "s.db"))
+    conv = orch.conversations[next(iter(orch.conversations))]
+    queue = orch.subscribe()
+    await orch.start()
+    try:
+        orch.handle_client_message(
+            {"type": "import_codex", "session": conv.id, "codex_session": sid})
+        created = await _until(queue, lambda e: e.get("type") == "session_created")
+        assert created["focus"] is True and created["title"] == f"codex · {sid[:8]}"
+        notice = await _until(queue, lambda e: e.get("type") == "notice")
+        assert created["session"] in notice["message"]
+        new_conv = orch.conversations[created["session"]]
+        assert any("导入的问题" in m.content for m in new_conv._messages)
+
+        orch.handle_client_message(
+            {"type": "import_codex", "session": conv.id, "codex_session": "不存在的id"})
+        err = await _until(queue, lambda e: e.get("type") == "error")
+        assert "未找到 Codex 会话" in err["message"]
+    finally:
+        await orch.stop()
+
+
+async def test_import_codex_targets_explicit_project(tmp_path: Path, monkeypatch) -> None:
+    """导入按显式 project 落位：即使当前会话属于别的项目。"""
+    import json
+
+    import agent.core.codex_import as codex
+    from agent.core.orchestrator import Orchestrator
+    from agent.core.session import SessionStore
+
+    sid = "01a034c4-db7a-7e70-92c6-8fb5993e03dc"
+    day = tmp_path / "codex" / "2026" / "09" / "21"
+    day.mkdir(parents=True)
+    (day / f"rollout-2026-09-21T10-00-00-{sid}.jsonl").write_text(json.dumps(
+        {"type": "response_item", "payload": {"type": "message", "role": "user",
+                                              "content": [{"type": "input_text",
+                                                           "text": "问答"}]}}), encoding="utf-8")
+    monkeypatch.setattr(codex, "sessions_dir", lambda: tmp_path / "codex")
+
+    project_b = tmp_path / "b"
+    project_b.mkdir()
+    orch = Orchestrator(main_provider=FakeProvider([ChatResult(text="x")]),
+                        executor_provider=FakeProvider([ChatResult(text="x")]),
+                        root=tmp_path / "a", store=SessionStore(tmp_path / "s.db"))
+    (tmp_path / "a").mkdir(exist_ok=True)
+    created = orch.create_project("B", str(project_b))
+    pid_b = created["project"]
+    conv_a = orch.conversations[next(iter(orch.conversations))]
+    queue = orch.subscribe()
+    await orch.start()
+    try:
+        orch.handle_client_message({"type": "import_codex", "session": conv_a.id,
+                                    "project": pid_b, "codex_session": sid})
+        event = await _until(queue, lambda e: e.get("type") == "session_created")
+        new_conv = orch.conversations[event["session"]]
+        assert new_conv.project_id == pid_b
+    finally:
+        await orch.stop()
+
+
+async def test_codex_login_then_logout(tmp_path: Path, monkeypatch) -> None:
+    """codex_login：浏览器登录成功 → 自动连接预设并绑定角色；codex_logout：清令牌。"""
+    import agent.providers.codex_auth as codex_auth
+    from agent.core.orchestrator import Orchestrator
+    from agent.core.session import SessionStore
+
+    tokens = {"access": "at", "refresh": "rt", "expires": 4102444800000,
+              "accountId": "acct-1234"}
+    def fake_login(**kw):
+        on_url = kw.get("on_url")
+        if on_url is not None:
+            on_url("https://auth.openai.com/oauth/authorize?state=demo")
+        return tokens
+
+    monkeypatch.setattr(codex_auth, "login", fake_login)
+
+    fake = FakeProvider([ChatResult(text="pong")] * 5)
+    fake.models = [{"id": "gpt-5.6-sol", "display_name": "GPT-5.6-Sol", "capability": {}}]
+    orch = Orchestrator(main_provider=None, executor_provider=None, root=tmp_path,
+                        store=SessionStore(tmp_path / "s.db"),
+                        provider_factory=lambda **kw: fake)
+    queue = orch.subscribe()
+    await orch.start()
+    try:
+        orch.handle_client_message({"type": "codex_login"})
+        pending = await _until(queue, lambda e: e.get("type") == "codex_login")
+        assert pending["state"] == "pending" and "auth.openai.com" in pending["url"]
+        notice = await _until(queue, lambda e: e.get("type") == "notice")
+        assert "登录成功" in notice["message"]
+        result = await _until(queue, lambda e: e.get("type") == "provider_result")
+        assert result["ok"] is True
+        assert orch.main_provider is fake
+        status = await _until(
+            queue, lambda e: e.get("type") == "provider_status"
+            and e.get("roles", {}).get("main", {}).get("configured") is True)
+        assert status["roles"]["main"]["model"]
+
+        orch.handle_client_message({"type": "codex_logout"})
+        await _until(queue, lambda e: e.get("type") == "notice" and "退出" in e["message"])
+    finally:
+        await orch.stop()
+    assert codex_auth.load_tokens() is None
+
+
+async def _wait(pred, timeout: float = 5.0) -> None:
+    async def _spin():
+        while not pred():
+            await asyncio.sleep(0.01)
+    await asyncio.wait_for(_spin(), timeout)
+
+
+async def test_undo_message_rolls_back_commander_only(tmp_path: Path) -> None:
+    """撤销指挥者消息：回滚该条及之后的对话；执行者上下文不受影响。"""
+    from agent.core.orchestrator import Orchestrator
+    from agent.core.session import SessionStore
+    from agent.providers import ChatResult, FakeProvider
+
+    store = SessionStore(tmp_path / "s.db")
+    main = FakeProvider([ChatResult(text="答一"), ChatResult(text="答二")])
+    orch = Orchestrator(main_provider=main,
+                        executor_provider=FakeProvider([ChatResult(text="执行者历史")]),
+                        root=tmp_path, store=store)
+    conv = orch.conversations[next(iter(orch.conversations))]
+    queue = orch.subscribe()
+    await orch.start()
+    try:
+        # 关掉直连回报，避免执行者历史额外产生一个系统回合干扰回合序号
+        orch.handle_client_message(
+            {"type": "set_executor_report", "session": conv.id, "on": False})
+        conv.executor_message("执行者的旧事")          # 执行者先留一条历史
+        await _wait(lambda: conv._dispatcher.tasks.get(1) == "done")
+
+        orch.handle_client_message({"type": "user", "session": conv.id, "text": "第一问"})
+        await _wait(lambda: len(store.list_turns(conv.id)) == 1
+                    and store.list_turns(conv.id)[0]["status"] == "completed")
+        orch.handle_client_message({"type": "user", "session": conv.id, "text": "第二问"})
+        await _wait(lambda: len(store.list_turns(conv.id)) == 2
+                    and store.list_turns(conv.id)[1]["status"] == "completed")
+        turn2 = store.list_turns(conv.id)[1]["id"]
+
+        orch.handle_client_message({"type": "undo_message", "session": conv.id, "turn": turn2})
+        done = await _until(queue, lambda e: e.get("type") == "undo_done")
+        assert done["turn"] == turn2 and done["text"] == "第二问"
+
+        turns = store.list_turns(conv.id)
+        assert [t["user_message"] for t in turns] == ["第一问"]
+        assert all("第二问" not in m.content for m in conv._messages)
+        assert all("答二" not in m.content for m in conv._messages)
+        # 执行者历史（含被撤销回合之前的内容）保持不动
+        executor_history = store.load(conv.id, "executor")
+        assert any("执行者的旧事" in m.content for m in executor_history)
+
+        orch.handle_client_message({"type": "undo_message", "session": conv.id, "turn": 99999})
+        err = await _until(queue, lambda e: e.get("type") == "error")
+        assert "不存在" in err["message"]
+    finally:
+        await orch.stop()
+        store.close()
+
+
+async def test_undo_while_running_leaves_no_orphan_event(tmp_path: Path) -> None:
+    """撤销进行中的回合：取消事件必须带正确 turn_id，最终不残留 turn_id=NULL 的孤儿。"""
+    import asyncio as _asyncio
+
+    from agent.core.orchestrator import Orchestrator
+    from agent.core.session import SessionStore
+    from agent.providers import ChatResult, FakeProvider
+
+    class SlowMain(FakeProvider):
+        async def chat(self, messages, tools=None, on_text=None, on_reasoning=None,
+                       session_id=None):
+            await _asyncio.sleep(30)          # 卡住，等被撤销
+            return ChatResult(text="不该出现")
+
+    store = SessionStore(tmp_path / "s.db")
+    orch = Orchestrator(main_provider=SlowMain([ChatResult(text="x")]),
+                        executor_provider=FakeProvider([ChatResult(text="x")]),
+                        root=tmp_path, store=store)
+    conv = orch.conversations[next(iter(orch.conversations))]
+    await orch.start()
+    try:
+        orch.handle_client_message({"type": "user", "session": conv.id, "text": "进行中"})
+        await _wait(lambda: store.list_turns(conv.id) and
+                    store.list_turns(conv.id)[0]["status"] == "running")
+        turn_id = store.list_turns(conv.id)[0]["id"]
+
+        orch.handle_client_message({"type": "undo_message", "session": conv.id, "turn": turn_id})
+        await _wait(lambda: store.list_turns(conv.id) == [])
+        await _asyncio.sleep(0.2)             # 给取消处理器留出余量
+        orphans = [e for e in store.list_events(conv.id) if e.get("turn_id") is None]
+        assert orphans == [], orphans
+    finally:
+        await orch.stop()
+        store.close()
+
+
+async def test_undo_legacy_message_errors_without_stopping_turn(tmp_path: Path) -> None:
+    """旧数据（缺边界）撤销：明确报错，且不打断正在运行的回合。"""
+    import asyncio as _asyncio
+
+    from agent.core.orchestrator import Orchestrator
+    from agent.core.session import SessionStore
+    from agent.providers import ChatResult, FakeProvider
+
+    class SlowMain(FakeProvider):
+        async def chat(self, messages, tools=None, on_text=None, on_reasoning=None,
+                       session_id=None):
+            await _asyncio.sleep(30)
+            return ChatResult(text="不该出现")
+
+    store = SessionStore(tmp_path / "s.db")
+    orch = Orchestrator(main_provider=SlowMain([ChatResult(text="x")]),
+                        executor_provider=FakeProvider([ChatResult(text="x")]),
+                        root=tmp_path, store=store)
+    conv = orch.conversations[next(iter(orch.conversations))]
+    queue = orch.subscribe()
+    await orch.start()
+    try:
+        # 造两条"旧数据"回合（无边界）：第二条才应被拒绝
+        store.create_turn(conv.id, "旧一", "completed")
+        legacy2 = store.create_turn(conv.id, "旧二", "completed")
+
+        orch.handle_client_message({"type": "user", "session": conv.id, "text": "进行中"})
+        await _wait(lambda: any(t["status"] == "running" for t in store.list_turns(conv.id)
+                                if t["user_message"] == "进行中"))
+
+        orch.handle_client_message(
+            {"type": "undo_message", "session": conv.id, "turn": legacy2})
+        err = await _until(queue, lambda e: e.get("type") == "error")
+        assert "旧数据" in err["message"]
+        running = [t for t in store.list_turns(conv.id) if t["user_message"] == "进行中"]
+        assert running and running[0]["status"] == "running"      # 回合未被停掉
+    finally:
+        await orch.stop()
+        store.close()

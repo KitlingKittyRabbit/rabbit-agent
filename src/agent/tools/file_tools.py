@@ -14,6 +14,9 @@ _IGNORE_DIRS = {".git", ".venv", "__pycache__", "node_modules", ".pytest_cache",
 _MAX_READ_LINES = 2000
 _MAX_GREP_MATCHES = 100
 _MAX_FILE_SIZE = 1024 * 1024
+_MAX_GREP_LINE_CHARS = 200  # 单条匹配的显示窗口（命中居中）
+_BINARY_SNIFF_BYTES = 8192
+_MAX_SKIP_NAMES = 10
 
 
 def _safe_path(root: Path, path: str) -> Path:
@@ -46,6 +49,46 @@ def _walk_files(base: Path):
             except OSError:
                 continue
             yield file
+
+
+def _is_binary(data: bytes) -> bool:
+    """非文本判定：前 8KB 含 NUL 字节（git/ripgrep 同类启发式）。"""
+    return b"\x00" in data[:_BINARY_SNIFF_BYTES]
+
+
+def _format_match(rel: str, lineno: int, line: str, match: re.Match, regex: re.Pattern) -> str:
+    """匹配行格式化：短行原样；长行取命中附近的定长窗口，并标注截断信息。"""
+    if len(line) <= _MAX_GREP_LINE_CHARS:
+        return f"{rel}:{lineno}: {line.strip()}"
+    match_len = match.end() - match.start()
+    if match_len >= _MAX_GREP_LINE_CHARS:
+        start = match.start()  # 命中超过窗口：从命中开头起显示
+    else:
+        start = match.start() - (_MAX_GREP_LINE_CHARS - match_len) // 2  # 命中居中
+    start = max(0, min(start, len(line) - _MAX_GREP_LINE_CHARS))  # 贴边时平移，窗口恒为定长
+    end = start + _MAX_GREP_LINE_CHARS
+    shown = line[start:end].strip()
+    prefix = "…" if start > 0 else ""
+    suffix = "…" if end < len(line) else ""
+    notes: list[str] = []
+    count = sum(1 for _ in regex.finditer(line))
+    if count > 1:
+        notes.append(f"{count} 处匹配")
+    if match_len > _MAX_GREP_LINE_CHARS:
+        notes.append(f"命中 {match_len} 字符，仅显示开头")
+    tail = "；" + "，".join(notes) if notes else ""
+    return f"{rel}:{lineno}: {prefix}{shown}{suffix}（本行共 {len(line)} 字符{tail}）"
+
+
+def _skipped_note(skipped: list[str]) -> str:
+    """非文本文件跳过清单：绝不静默。"""
+    if not skipped:
+        return ""
+    if len(skipped) > _MAX_SKIP_NAMES:
+        names = "、".join(skipped[:_MAX_SKIP_NAMES]) + "、…"
+    else:
+        names = "、".join(skipped)
+    return f"\n（跳过 {len(skipped)} 个非文本文件：{names}）"
 
 
 def make_read_tools(root: Path) -> list[Tool]:
@@ -95,16 +138,27 @@ def make_read_tools(root: Path) -> list[Tool]:
         except re.error as e:
             raise ToolError(f"正则无效: {e}") from e
         matches: list[str] = []
+        skipped: list[str] = []
         for file in _walk_files(base):
-            rel = file.relative_to(resolved_root)
+            rel = str(file.relative_to(resolved_root))
+            raw = file.read_bytes()
+            if _is_binary(raw):
+                skipped.append(rel)
+                continue
             for lineno, line in enumerate(
-                file.read_text(encoding="utf-8", errors="ignore").splitlines(), 1
+                raw.decode("utf-8", errors="ignore").splitlines(), 1
             ):
-                if regex.search(line):
-                    matches.append(f"{rel}:{lineno}: {line.strip()}")
+                match = regex.search(line)
+                if match:
+                    matches.append(_format_match(rel, lineno, line, match, regex))
                     if len(matches) >= _MAX_GREP_MATCHES:
-                        return "\n".join(matches) + "\n...（匹配过多，已截断）"
-        return "\n".join(matches) if matches else "(无匹配)"
+                        matches.append(
+                            f"...（已达 {_MAX_GREP_MATCHES} 条上限，后续未显示；"
+                            "建议缩小 path 或 pattern）"
+                        )
+                        return "\n".join(matches) + _skipped_note(skipped)
+        body = "\n".join(matches) if matches else "(无匹配)"
+        return body + _skipped_note(skipped)
 
     return [
         Tool(

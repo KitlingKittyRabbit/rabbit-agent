@@ -7,7 +7,12 @@ import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
-from ..providers import AnthropicCompatProvider, OpenAICompatProvider, Provider
+from ..providers import (
+    AnthropicCompatProvider,
+    CodexResponsesProvider,
+    OpenAICompatProvider,
+    Provider,
+)
 
 
 class ConfigError(Exception):
@@ -16,7 +21,7 @@ class ConfigError(Exception):
 
 @dataclass
 class RoleConfig:
-    protocol: str  # "openai" | "anthropic"
+    protocol: str  # "openai" | "anthropic" | "openai-responses"
     model: str
     base_url: str | None
     api_key_env: str | None
@@ -71,8 +76,11 @@ def load_config(path: str | Path) -> AppConfig:
 
 def build_provider(role: RoleConfig) -> Provider:
     """静态配置构建 provider；无效组合直接报错，绝不猜测端点或补占位 key 外呼。"""
-    if role.protocol not in ("openai", "anthropic"):
+    if role.protocol not in ("openai", "anthropic", "openai-responses"):
         raise ConfigError(f"未知协议: {role.protocol}")
+    if role.protocol == "openai-responses":
+        # ChatGPT 会员登录：凭据走 OAuth，不需要 api_key
+        return CodexResponsesProvider(base_url=role.base_url, model=role.model)
     if role.api_key_env:
         api_key = os.environ.get(role.api_key_env, "")
         if not api_key:
@@ -98,12 +106,22 @@ def make_provider(
     base_url: str | None = None,
     context_window: int | None = None,
     reasoning_effort: str | None = None,
+    echo_reasoning_field: str | None = None,
 ) -> Provider:
-    """按显式参数构建 provider（运行时连接用，不经环境变量）。"""
+    """按显式参数构建 provider（运行时连接用，不经环境变量）。
+
+    echo_reasoning_field：目录声明 interleaved 的模型，下一轮按该字段回传思考。
+    """
+    if protocol == "openai-responses":
+        return CodexResponsesProvider(
+            base_url=base_url, api_key=api_key, model=model,
+            context_window=context_window, reasoning_effort=reasoning_effort,
+        )
     if protocol == "openai":
         return OpenAICompatProvider(
             base_url=base_url, api_key=api_key, model=model,
             context_window=context_window, reasoning_effort=reasoning_effort,
+            echo_reasoning_field=echo_reasoning_field,
         )
     if protocol == "anthropic":
         return AnthropicCompatProvider(

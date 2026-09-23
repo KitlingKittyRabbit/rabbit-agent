@@ -109,13 +109,15 @@ async def test_steering_message_reaches_next_model_round(tmp_path: Path) -> None
 
 
 async def test_direct_message_to_idle_executor_dispatches_task(tmp_path: Path) -> None:
-    """执行者空闲时直接对它说话 = 新任务；主时间线留灰色提示、指挥者上下文不含它。"""
+    """执行者空闲时直接对它说话 = 新任务；开关关时主时间线留提示、指挥者上下文不含它。"""
     executor = FakeProvider([ChatResult(text="执行者收到")])
     orch = make_orch(tmp_path, FakeProvider([ChatResult(text="x")]), executor,
                      store=SessionStore(tmp_path / "s.db"))
     conv = orch.conversations[_sid(orch)]
     await orch.start()
     try:
+        orch.handle_client_message(
+            {"type": "set_executor_report", "session": conv.id, "on": False})
         conv.executor_message("你好执行者")
         await _wait(lambda: len(executor.calls) >= 1)
         await _wait(lambda: conv._dispatcher.tasks.get(1) == "done")
@@ -307,13 +309,15 @@ async def test_idle_direct_message_flushes_leftover_first(tmp_path: Path) -> Non
 
 
 async def test_direct_executor_chat_does_not_notify_commander(tmp_path: Path) -> None:
-    """直连执行者的对话只留在执行者窗口：不回报指挥者、不唤醒它。"""
+    """回报开关关：直连执行者的对话只留在窗口，不回报指挥者、不唤醒它。"""
     main = FakeProvider([ChatResult(text="不应被唤醒")])
     executor = FakeProvider([ChatResult(text="聊天回复")])
     orch = make_orch(tmp_path, main, executor)
     conv = orch.conversations[_sid(orch)]
     await orch.start()
     try:
+        orch.handle_client_message(
+            {"type": "set_executor_report", "session": conv.id, "on": False})
         conv.executor_message("你心情怎么样")
         await _wait(lambda: len(executor.calls) >= 1)
         await _wait(lambda: conv._dispatcher.tasks.get(1) == "done")
@@ -394,12 +398,14 @@ async def test_intervention_steer_prompts_accumulate(tmp_path: Path) -> None:
 
 
 async def test_direct_chat_without_interrupt_not_reported(tmp_path: Path) -> None:
-    """对照：没有中断发生时，直连对话不回报指挥者（既有规则不被破坏）。"""
+    """回报开关关：没有中断时，直连对话不回报指挥者。"""
     executor = FakeProvider([ChatResult(text="闲聊回复")])
     orch = make_orch(tmp_path, FakeProvider([ChatResult(text="x")]), executor)
     conv = orch.conversations[_sid(orch)]
     await orch.start()
     try:
+        orch.handle_client_message(
+            {"type": "set_executor_report", "session": conv.id, "on": False})
         conv.executor_message("你心情怎么样")
         await _wait(lambda: conv._dispatcher.tasks.get(1) == "done")
         await asyncio.sleep(0.2)
@@ -782,3 +788,165 @@ async def test_persist_interrupted_uses_latest_assistant_identity(tmp_path: Path
     assert "未完成" in msgs[-1].content
     assert sum(1 for m in msgs if m.role == "assistant") == 2   # 无重复追加
     store.close()
+
+
+async def test_conversation_and_executor_pass_their_session_id(tmp_path: Path) -> None:
+    """真实编排：指挥者回合与执行者任务都把会话 id 传给 provider（Go 网关要求）。"""
+    class SessionRecorder(FakeProvider):
+        def __init__(self, script):
+            super().__init__(script)
+            self.sessions: list = []
+
+        async def chat(self, messages, tools=None, on_text=None, on_reasoning=None,
+                       session_id=None):
+            self.sessions.append(session_id)
+            return await super().chat(messages, tools, on_text, on_reasoning)
+
+    main = SessionRecorder([ChatResult(text="好")])
+    executor = SessionRecorder([ChatResult(text="做完了")])
+    orch = make_orch(tmp_path, main, executor)
+    conv = orch.conversations[_sid(orch)]
+    await orch.start()
+    try:
+        orch.handle_client_message({"type": "user", "session": conv.id, "text": "你好"})
+        await _wait(lambda: main.sessions)
+        assert set(main.sessions) == {conv.id}
+        conv._dispatcher.dispatch("干个活")
+        await _wait(lambda: conv._dispatcher.tasks.get(1) == "done")
+        assert executor.sessions and set(executor.sessions) == {conv.id}
+    finally:
+        await orch.stop()
+
+
+async def test_task_diff_event_records_file_changes(tmp_path: Path) -> None:
+    """任务里写了/改了文件：结束时落一条 task_diff（路径 + 增删行数）。"""
+    import json
+
+    executor = FakeProvider([
+        ChatResult(tool_calls=[
+            ToolCall(id="w1", name="write_file",
+                     arguments={"path": "a.txt", "content": "一\n二\n三\n"}),
+            ToolCall(id="e1", name="edit_file",
+                     arguments={"path": "a.txt", "old": "三\n", "new": "三\n四\n"}),
+        ], stop_reason="tool_use"),
+        ChatResult(text="完成"),
+    ])
+    store = SessionStore(tmp_path / "s.db")
+    orch = make_orch(tmp_path, chatty_main(), executor, store=store)
+    conv = orch.conversations[_sid(orch)]
+    await orch.start()
+    try:
+        conv._dispatcher.dispatch("写文件")
+        await _wait(lambda: conv._dispatcher.tasks.get(1) == "done")
+        events = store.list_events(conv.id)
+    finally:
+        await orch.stop()
+    diffs = [e for e in events if e["type"] == "task_diff"]
+    assert len(diffs) == 1
+    payload = json.loads(diffs[0]["text"])
+    assert payload == {"files": [{"path": "a.txt", "added": 5, "removed": 1}]}
+    assert diffs[0]["task_id"] == 1
+
+
+async def test_interrupted_task_still_records_diff(tmp_path: Path) -> None:
+    """中断也保留已发生的文件改动（与半截输出同一原则）。"""
+    import json
+
+    gate = asyncio.Event()
+    executor = _BlockingFake([
+        ChatResult(tool_calls=[ToolCall(id="w1", name="write_file",
+                                        arguments={"path": "b.txt", "content": "x\n"})],
+                   stop_reason="tool_use"),
+        ChatResult(text="完成"),
+    ], gate)
+    store = SessionStore(tmp_path / "s.db")
+    orch = make_orch(tmp_path, chatty_main(), executor, store=store)
+    conv = orch.conversations[_sid(orch)]
+    await orch.start()
+    try:
+        conv._dispatcher.dispatch("写文件")
+        await _wait(lambda: (tmp_path / "b.txt").exists())
+        conv.executor_stop()
+        await _wait(lambda: conv._dispatcher.tasks.get(1) == "cancelled")
+        events = store.list_events(conv.id)
+    finally:
+        gate.set()
+        await orch.stop()
+    diffs = [e for e in events if e["type"] == "task_diff"]
+    assert diffs and json.loads(diffs[0]["text"])["files"][0]["path"] == "b.txt"
+
+
+async def test_diff_ignores_failed_file_tools(tmp_path: Path) -> None:
+    """失败的文件工具不算改动：edit 找不到原文、路径越界都不计入 task_diff。"""
+    import json
+
+    executor = FakeProvider([
+        ChatResult(tool_calls=[
+            ToolCall(id="e1", name="edit_file",
+                     arguments={"path": "a.txt", "old": "不存在", "new": "x\n"}),
+            ToolCall(id="w1", name="write_file",
+                     arguments={"path": "../escape.txt", "content": "x\n"}),
+            ToolCall(id="w2", name="write_file",
+                     arguments={"path": "ok.txt", "content": "好\n"}),
+        ], stop_reason="tool_use"),
+        ChatResult(text="完成"),
+    ])
+    store = SessionStore(tmp_path / "s.db")
+    orch = make_orch(tmp_path, chatty_main(), executor, store=store)
+    conv = orch.conversations[_sid(orch)]
+    await orch.start()
+    try:
+        conv._dispatcher.dispatch("写文件")
+        await _wait(lambda: conv._dispatcher.tasks.get(1) == "done")
+        events = store.list_events(conv.id)
+    finally:
+        await orch.stop()
+    diffs = [e for e in events if e["type"] == "task_diff"]
+    assert len(diffs) == 1
+    payload = json.loads(diffs[0]["text"])
+    assert payload == {"files": [{"path": "ok.txt", "added": 1, "removed": 0}]}
+
+
+async def test_diff_counts_success_with_error_word_in_content(tmp_path: Path) -> None:
+    """守卫按成功文案判定：路径/内容含"错误"字样的成功写入仍要计数。"""
+    import json
+
+    executor = FakeProvider([
+        ChatResult(tool_calls=[ToolCall(id="w1", name="write_file",
+                                        arguments={"path": "错误报告.txt",
+                                                   "content": "错误一\n错误二\n"})],
+                   stop_reason="tool_use"),
+        ChatResult(text="完成"),
+    ])
+    store = SessionStore(tmp_path / "s.db")
+    orch = make_orch(tmp_path, chatty_main(), executor, store=store)
+    conv = orch.conversations[_sid(orch)]
+    await orch.start()
+    try:
+        conv._dispatcher.dispatch("写文件")
+        await _wait(lambda: conv._dispatcher.tasks.get(1) == "done")
+        events = store.list_events(conv.id)
+    finally:
+        await orch.stop()
+    diffs = [e for e in events if e["type"] == "task_diff"]
+    assert diffs and json.loads(diffs[0]["text"]) == {
+        "files": [{"path": "错误报告.txt", "added": 2, "removed": 0}]}
+
+
+async def test_direct_chat_reported_when_switch_on(tmp_path: Path) -> None:
+    """回报开关开：即使没有中断，直连执行者的结果也回报指挥者（带用户原话）。"""
+    main = FakeProvider([ChatResult(text="收到")])
+    executor = FakeProvider([ChatResult(text="执行者回答")])
+    orch = make_orch(tmp_path, main, executor)
+    conv = orch.conversations[_sid(orch)]
+    await orch.start()
+    try:
+        assert conv.executor_report() is True          # 默认开
+        conv.executor_message("你心情怎么样")
+        await _wait(lambda: any("[任务 #1 执行者回复]" in m.content for m in conv._messages))
+    finally:
+        await orch.stop()
+    report = next(m.content for m in conv._messages if "[任务 #1 执行者回复]" in m.content)
+    assert "你对执行者说：你心情怎么样" in report
+    assert "执行者输出：执行者回答" in report
+    assert main.calls, "指挥者应被唤醒去处理这条回报"

@@ -302,3 +302,46 @@ async def test_reasoning_passthrough_from_provider() -> None:
     assert received == ["思考过程"]
     assert result.text == "答案"
     assert result.usage.reasoning_tokens == 0
+
+
+async def test_loop_passes_session_id_only_when_supported() -> None:
+    """provider 接受 session_id 时透传（OpenCode Go 需要每会话稳定 id）；不接受则不强塞。"""
+
+    class Recorder(FakeProvider):
+        def __init__(self) -> None:
+            super().__init__([ChatResult(text="ok")])
+            self.sessions: list = []
+
+        async def chat(self, messages, tools=None, on_text=None, on_reasoning=None,
+                       session_id=None):
+            self.sessions.append(session_id)
+            return await super().chat(messages, tools, on_text, on_reasoning)
+
+    recorder = Recorder()
+    loop = AgentLoop(recorder, make_registry(), session_id="conv-7")
+    await loop.run([Message(role="user", content="hi")])
+    assert recorder.sessions == ["conv-7"]
+
+    plain = FakeProvider([ChatResult(text="ok")])
+    await AgentLoop(plain, make_registry(), session_id="conv-7").run(
+        [Message(role="user", content="hi")]
+    )
+    assert len(plain.calls) == 1   # 旧签名不被强塞新参数
+
+
+async def test_loop_passes_session_id_without_reasoning_support() -> None:
+    """不支持 on_reasoning 的 provider：session_id 仍要透传（第二条调用路径）。"""
+
+    class NoReasoningRecorder(FakeProvider):
+        def __init__(self) -> None:
+            super().__init__([ChatResult(text="ok")])
+            self.sessions: list = []
+
+        async def chat(self, messages, tools=None, on_text=None, session_id=None):
+            self.sessions.append(session_id)
+            return await super().chat(messages, tools, on_text)
+
+    recorder = NoReasoningRecorder()
+    loop = AgentLoop(recorder, make_registry(), session_id="conv-8")
+    await loop.run([Message(role="user", content="hi")])
+    assert recorder.sessions == ["conv-8"]

@@ -34,6 +34,7 @@ SUBAGENT_TEXT_DELTA = "subagent_text_delta"
 SUBAGENT_TOOL_STARTED = "subagent_tool_started"
 SUBAGENT_TOOL_FINISHED = "subagent_tool_finished"
 SUBAGENT_COMPLETED = "subagent_completed"
+TASK_DIFF = "task_diff"  # 任务文件改动汇总（写/编辑工具的行数统计）
 SUBAGENT_FAILED = "subagent_failed"
 FINAL_STARTED = "final_started"
 FINAL_TEXT_DELTA = "final_text_delta"

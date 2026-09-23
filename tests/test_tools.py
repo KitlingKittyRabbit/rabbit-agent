@@ -72,6 +72,114 @@ async def test_grep_ignores_git_directory(root: Path) -> None:
     assert ".git" not in output
 
 
+async def test_grep_long_line_centers_on_match(root: Path) -> None:
+    (root / "long.txt").write_text("x" * 5000 + "NEEDLE" + "y" * 5000, encoding="utf-8")
+    output = await read_registry(root).call("grep", {"pattern": "NEEDLE"})
+    assert "NEEDLE" in output
+    assert "本行共 10006 字符" in output
+    assert len(output) < 500  # 单条输出压到窗口级别
+
+
+async def test_grep_long_match_window_stays_bounded(root: Path) -> None:
+    (root / "match.txt").write_text("A" * 1000 + "B" * 1000, encoding="utf-8")
+    output = await read_registry(root).call("grep", {"pattern": "A{500}"})
+    assert "命中 500 字符，仅显示开头" in output
+    assert len(output) < 600  # 命中超长也不突破窗口硬上限
+
+
+async def test_grep_medium_match_window_stays_bounded(root: Path) -> None:
+    (root / "medium.txt").write_text("x" * 5000 + "N" * 150 + "y" * 5000, encoding="utf-8")
+    output = await read_registry(root).call("grep", {"pattern": "N{150}"})
+    assert "N" * 150 in output  # 命中完整可见
+    assert "仅显示开头" not in output
+    assert len(output) < 300  # 窗口恒为 200
+
+
+async def test_grep_edge_match_window_stays_bounded(root: Path) -> None:
+    (root / "edge.txt").write_text("x" * 5000 + "N" * 199 + "y" * 5000, encoding="utf-8")
+    output = await read_registry(root).call("grep", {"pattern": "N{199}"})
+    assert "N" * 199 in output
+    assert len(output) < 300
+
+
+async def test_grep_skip_list_truncates_names(root: Path) -> None:
+    for i in range(12):
+        (root / f"blob{i:02d}.bin").write_bytes(b"\x00NEEDLE\x00")
+    output = await read_registry(root).call("grep", {"pattern": "NEEDLE"})
+    assert "跳过 12 个非文本文件" in output
+    assert output.count("blob") == 10  # 名单最多列 10 个
+    assert "、…）" in output
+
+
+async def test_grep_reports_multiple_matches_per_line(root: Path) -> None:
+    line = "x" * 5000 + "hit" + "y" * 100 + "hit" + "z" * 5000
+    (root / "multi.txt").write_text(line, encoding="utf-8")
+    output = await read_registry(root).call("grep", {"pattern": "hit"})
+    assert "2 处匹配" in output
+
+
+async def test_grep_match_limit_marks_cap(root: Path) -> None:
+    for i in range(101):
+        (root / f"m{i:03d}.txt").write_text("NEEDLE", encoding="utf-8")
+    output = await read_registry(root).call("grep", {"pattern": "NEEDLE"})
+    assert "已达 100 条上限" in output
+    assert "建议缩小 path 或 pattern" in output
+
+
+async def test_grep_skips_binary_and_reports_names(root: Path) -> None:
+    (root / "blob.bin").write_bytes(b"\x00\x01NEEDLE\x02")
+    (root / "text.txt").write_text("NEEDLE here", encoding="utf-8")
+    output = await read_registry(root).call("grep", {"pattern": "NEEDLE"})
+    assert "text.txt:1: NEEDLE here" in output
+    assert "跳过 1 个非文本文件：blob.bin" in output
+
+
+async def test_grep_binary_only_reports_no_match_plus_skip(root: Path) -> None:
+    (root / "blob.bin").write_bytes(b"\x00NEEDLE\x00")
+    output = await read_registry(root).call("grep", {"pattern": "NEEDLE"})
+    assert output.startswith("(无匹配)")
+    assert "blob.bin" in output
+
+
+def test_cap_output_short_text_unchanged() -> None:
+    from agent.tools import cap_output
+
+    assert cap_output("短文本") == "短文本"
+
+
+def test_cap_output_exact_boundary() -> None:
+    from agent.tools import cap_output
+    from agent.tools.base import MAX_OUTPUT_CHARS
+
+    output = cap_output("x" * (MAX_OUTPUT_CHARS + 1))
+    assert "中间省略 1 字符" in output
+    assert f"完整共 {MAX_OUTPUT_CHARS + 1} 字符" in output
+
+
+async def test_tool_output_cap_keeps_head_tail_and_reports_omitted() -> None:
+    from agent.providers import ToolSpec
+    from agent.tools import Tool, ToolRegistry
+    from agent.tools.base import MAX_OUTPUT_CHARS
+
+    async def huge(args: dict) -> str:
+        return "头" * 50_000 + "尾" * 50_000
+
+    registry = ToolRegistry([Tool(ToolSpec("huge", "d", {}), huge)])
+    output = await registry.call("huge", {})
+    assert "中间省略 70000 字符" in output
+    assert "完整共 100000 字符" in output
+    assert output.startswith("头")
+    assert output.endswith("尾")
+    assert len(output) < MAX_OUTPUT_CHARS + 100
+
+
+async def test_read_file_single_line_capped(root: Path) -> None:
+    (root / "huge.txt").write_text("x" * 200_000, encoding="utf-8")
+    output = await read_registry(root).call("read_file", {"path": "huge.txt"})
+    assert "中间省略" in output
+    assert len(output) < 31_000
+
+
 async def test_write_file_creates_parents(root: Path) -> None:
     output = await write_registry(root).call(
         "write_file", {"path": "deep/dir/c.txt", "content": "内容"}
@@ -118,6 +226,15 @@ async def test_shell_echo_and_exit_code(root: Path) -> None:
     assert "你好" in output
     output = await registry.call("run_shell", {"command": "exit 3"})
     assert "exit code: 3" in output
+
+
+async def test_shell_output_capped_with_count(root: Path) -> None:
+    registry = build_registry(root, write=False, shell=True)
+    output = await registry.call(
+        "run_shell", {"command": "python3 -c \"print('x' * 20000)\""}
+    )
+    assert "中间省略" in output
+    assert len(output) < 8500
 
 
 async def test_shell_runs_in_working_dir(root: Path) -> None:

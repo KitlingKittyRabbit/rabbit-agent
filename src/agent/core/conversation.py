@@ -104,6 +104,8 @@ class Conversation:
         self._intervention_origin: dict[int, int] = {}
         # 每个中断故事里用户对执行者说的话（按被中断任务号归档，交付后弹出）
         self._intervention_prompts: dict[int, list[str]] = {}
+        # 直连回报：task_id -> 用户对执行者说的话（开关打开时，完成后回报指挥者）
+        self._direct_report: dict[int, str] = {}
         stored_flag = (
             registry.store.get_flag(session_id, "report_executor")
             if registry.store is not None
@@ -211,6 +213,7 @@ class Conversation:
             self._interrupted_task = None
             self._intervention_origin.clear()
             self._intervention_prompts.clear()
+            self._direct_report.clear()
         if self._registry.store is not None:
             self._registry.store.set_flag(self.id, "report_executor", "1" if on else "0")
 
@@ -218,8 +221,17 @@ class Conversation:
         """执行者进行中任务的未持久化消息（供 /api/executor_messages 拼接展示）。"""
         return self._executor.inflight_messages()
 
+    _DIRECT_PREFIXES = ("[用户直接对执行者说]\n", "[用户对执行者插话]\n")
+
+    @classmethod
+    def _strip_direct_prefix(cls, text: str) -> str:
+        for prefix in cls._DIRECT_PREFIXES:
+            if text.startswith(prefix):
+                return text[len(prefix):]
+        return text
+
     def _dispatch_direct(self, text: str) -> int:
-        """派发"用户直连执行者"的任务：默认只留在窗口；中断介入的派生任务会回报指挥者。"""
+        """派发"用户直连执行者"的任务：开关打开时其结果回报指挥者（含中断介入）。"""
         self._direct_dispatch = True
         try:
             return self._dispatcher.dispatch(text)
@@ -235,6 +247,38 @@ class Conversation:
             turns = store.list_turns(self.id)
             return turns[-1]["id"] if turns else None
         return None
+
+    async def stop_and_wait(self, timeout: float = 2.0) -> None:
+        """停止当前回合/任务，并等取消落定（事件带正确 turn_id 后再撤销）。"""
+        self.stop()
+        task = self._turn_task
+        if task is not None:
+            with contextlib.suppress(asyncio.CancelledError, TimeoutError, Exception):
+                await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+    def undo_supported(self, turn_id: int) -> bool | None:
+        store = self._registry.store
+        return store.turn_undoable(self.id, turn_id) if store is not None else None
+
+    def undo_turn(self, turn_id: int) -> str | None:
+        """回滚指挥者对话到该消息之前；执行者上下文与文件不动。"""
+        store = self._registry.store
+        if store is None:
+            return None
+        info = store.undo_from(self.id, turn_id)
+        if info is None:
+            return None
+        if info.get("unsupported"):
+            raise ValueError("这条消息来自旧数据（缺少消息边界记录），不支持撤销；"
+                             "之后的新消息不受影响")
+        store.truncate_messages(self.id, info["msg_count"], "main")
+        self._messages = store.load(self.id)
+        self._current_turn_id = None
+        self._turn_anchor = None
+        self._emit({"type": "undo_done", "turn": turn_id, "text": info["user_message"]})
+        return info["user_message"]
 
     def executor_message(self, text: str) -> None:
         """用户直接对执行者说话：执行中=插话（下一生效）；空闲=新任务。
@@ -358,7 +402,8 @@ class Conversation:
             if m.role == "user" and not m.content.startswith("[任务 #")
         )
         store = registry.store
-        turn_id = store.create_turn(self.id, user_text, TURN_RUNNING) if store else None
+        turn_id = (store.create_turn(self.id, user_text, TURN_RUNNING,
+                                     msg_count=len(self._messages)) if store else None)
         self._current_turn_id = turn_id
         self._dispatcher.current_turn_id = turn_id
         self._record_event(TURN_STARTED, actor=ACTOR_MAIN, text=user_text)
@@ -369,6 +414,7 @@ class Conversation:
         loop = AgentLoop(
             registry.main_provider,
             self._main_tools,
+            session_id=self.id,
             max_steps=registry.max_steps_main,
             compactor=self._compact,
             on_tool_event=self._on_main_tool,
@@ -386,12 +432,14 @@ class Conversation:
         except asyncio.CancelledError:
             if store and turn_id is not None:
                 store.finish_turn(turn_id, TURN_CANCELLED)
-            self._record_event(TURN_CANCELLED_EVENT, actor=ACTOR_MAIN)
+            # 显式带 turn_id：取消可能晚于撤销执行，不能依赖 _current_turn_id
+            self._record_event(TURN_CANCELLED_EVENT, actor=ACTOR_MAIN, turn_id=turn_id)
             raise
         except Exception as e:
             if store and turn_id is not None:
                 store.finish_turn(turn_id, TURN_ERROR)
-            self._record_event(TURN_FAILED_EVENT, actor=ACTOR_MAIN, text=f"{type(e).__name__}: {e}")
+            self._record_event(TURN_FAILED_EVENT, actor=ACTOR_MAIN, turn_id=turn_id,
+                               text=f"{type(e).__name__}: {e}")
             raise
         self._turn_anchor = None
         # 压缩/截断可能已改写 working：整段替换（去掉 system），持久化同步整段重写
@@ -457,7 +505,7 @@ class Conversation:
             messages, provider=registry.main_provider,
             budget_tokens=budget["compact_at"], tool_specs=self._main_tools.specs(),
             on_compacted=self._emit, usage=self._compact_usage,
-            preserve=self._turn_anchor,
+            preserve=self._turn_anchor, session_id=self.id,
         )
         if compacted:
             self._epoch += 1
@@ -515,9 +563,11 @@ class Conversation:
                 and self._report_executor):
             self._interrupted_task = event.id            # 记下被用户中断的任务，等介入结果
             self._intervention_prompts.setdefault(event.id, [])
+        direct_prompt: str | None = None
         if terminal:
             self._task_turns.pop(event.id, None)
             self._direct_tasks.discard(event.id)
+            direct_prompt = self._direct_report.pop(event.id, None)
             if event.status in ("done", "incomplete", "error"):
                 # 任务正常/异常结束：未送达的插话转成新任务（用户主动停止时不自动重开）
                 for leftover in self._executor.take_undelivered():
@@ -532,7 +582,7 @@ class Conversation:
         )
         if event.status != "running" and not direct:
             # running 仅作 UI/持久化通知；唤醒 main 会白跑一轮 LLM
-            # 直连执行者的任务不回报指挥者（它没派过，避免"任务完成"误导）
+            # 指挥者自己派的任务：无条件回报（直连任务走下面的开关分支）
             self._inbox.put_nowait(
                 Message(role="user", content=f"[任务 #{event.id} {status_text}]\n{event.output}")
             )
@@ -546,14 +596,25 @@ class Conversation:
                     f"用户对执行者说：{prompts}\n"
                     f"执行者输出：{event.output}"
                 )))
+        elif (self._report_executor and direct_prompt is not None
+              and event.status in ("done", "error", "incomplete", "unconfigured")):
+            # 直连回报：把"你对执行者说的话 + 执行者输出"一并回报指挥者
+            self._inbox.put_nowait(Message(role="user", content=(
+                f"[任务 #{event.id} 执行者回复]\n"
+                f"你对执行者说：{self._strip_direct_prefix(direct_prompt)}\n"
+                f"执行者输出：{event.output}"
+            )))
 
     def _on_task_created(self, task_id: int, title: str, prompt: str) -> None:
         """派发即登记 TaskRun（queued）并广播；parent turn 此刻固定。"""
         if self._direct_dispatch:
             self._direct_tasks.add(task_id)
-            if self._interrupted_task is not None and self._report_executor:
-                # 记住来源任务号：之后即使又发生新的中断，本任务仍回报它纠偏的那个
-                self._intervention_origin[task_id] = self._interrupted_task
+            if self._report_executor:
+                if self._interrupted_task is not None:
+                    # 记住来源任务号：之后即使又发生新的中断，本任务仍回报它纠偏的那个
+                    self._intervention_origin[task_id] = self._interrupted_task
+                else:
+                    self._direct_report[task_id] = prompt    # 直连回报：记住用户原话
         else:
             self._interrupted_task = None               # 指挥者重新派活：上一段中断故事翻篇
         registry = self._registry

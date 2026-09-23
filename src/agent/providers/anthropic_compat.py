@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from uuid import uuid4
 
 import anthropic
 import httpx2
@@ -19,6 +20,7 @@ from .base import (
     ToolCall,
     ToolSpec,
     Usage,
+    is_opencode_host,
 )
 from .listing import fetch_models
 
@@ -65,10 +67,22 @@ class AnthropicCompatProvider:
             # trust_env=False：不吃环境代理变量（桌面代理 socks:// 等会让 SDK 初始化崩溃）
             client_kwargs["http_client"] = httpx2.AsyncClient(trust_env=False)
         self._client = anthropic.AsyncAnthropic(**client_kwargs)
+        self._opencode_host = is_opencode_host(base_url)
+        self._session_fallback = uuid4().hex
+
+    def _session_headers(self, session_id: str | None) -> dict | None:
+        """OpenCode Go/Zen 网关要求自定义 UA + 每会话稳定的 x-opencode-session。"""
+        if not self._opencode_host:
+            return None
+        return {
+            "User-Agent": "rabbit-agent/0.1",
+            "x-opencode-session": session_id or self._session_fallback,
+        }
 
     async def list_models(self) -> list[dict]:
         """拉取 Anthropic 模型列表（内存凭据，SDK/HTTP 均不带 key 入 URL）。"""
-        return await fetch_models("anthropic", self._base_url, self._api_key or "")
+        return await fetch_models("anthropic", self._base_url, self._api_key or "",
+                                  session_id=self._session_fallback)
 
     async def chat(
         self,
@@ -76,6 +90,7 @@ class AnthropicCompatProvider:
         tools: Sequence[ToolSpec] | None = None,
         on_text: OnText | None = None,
         on_reasoning: OnReasoning | None = None,
+        session_id: str | None = None,
     ) -> ChatResult:
         system, converted = self._convert_messages(messages)
         kwargs: dict = {"model": self._model, "messages": converted, "max_tokens": self._max_tokens}
@@ -92,6 +107,9 @@ class AnthropicCompatProvider:
             if budget:
                 kwargs["thinking"] = {"type": "enabled", "budget_tokens": budget}
                 kwargs["max_tokens"] = max(self._max_tokens, budget + 1_024)
+        headers = self._session_headers(session_id)
+        if headers:
+            kwargs["extra_headers"] = headers
         try:
             reasoning_parts: list[str] = []
             async with self._client.messages.stream(**kwargs) as stream:
@@ -227,3 +245,5 @@ class AnthropicCompatProvider:
             reasoning_blocks=reasoning_blocks,
             blocks=blocks,
         )
+
+

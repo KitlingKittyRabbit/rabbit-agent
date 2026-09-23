@@ -11,10 +11,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
+import re
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
@@ -115,6 +117,19 @@ def create_app(orchestrator, token: str = "") -> FastAPI:
             return JSONResponse({"error": "未授权"}, status_code=401)
         return await _call_read_tool(orchestrator, project, "ls", {"path": path})
 
+    @app.get("/api/files")
+    async def api_files(
+        project: str = Query(...), q: str = Query(""), limit: int = Query(200),
+        token: str = Query(""),
+    ) -> JSONResponse:
+        """@ 提及的候选路径（文件与目录，目录带尾斜杠；只读）。"""
+        if not _token_ok(token):
+            return JSONResponse({"error": "未授权"}, status_code=401)
+        root = orchestrator.project_root(project)
+        if root is None:
+            return JSONResponse({"error": f"项目不存在: {project}"}, status_code=404)
+        return JSONResponse({"paths": list_project_files(root, q, max(1, min(limit, 500)))})
+
     @app.get("/api/read")
     async def api_read(
         project: str = Query(...),
@@ -152,6 +167,56 @@ def create_app(orchestrator, token: str = "") -> FastAPI:
         return JSONResponse({"path": str(base), "parent": str(base.parent), "dirs": dirs})
 
     # ---------- 历史 API（UI timeline 数据源，与 LLM messages 分离） ----------
+
+    @app.post("/api/upload")
+    async def api_upload(
+        request: Request, project: str = Query(...), filename: str = Query(...),
+        token: str = Query(""),
+    ) -> JSONResponse:
+        """拖放文件：存到 <项目>/.agent/attachments/ 并返回可 @ 的相对路径。"""
+        if not _token_ok(token):
+            return JSONResponse({"error": "未授权"}, status_code=401)
+        root = orchestrator.project_root(project)
+        if root is None:
+            return JSONResponse({"error": f"项目不存在: {project}"}, status_code=404)
+        limit = 20 * 1024 * 1024
+        declared = request.headers.get("content-length")
+        if declared and declared.isdigit() and int(declared) > limit:
+            return JSONResponse({"error": "文件超过 20MB"}, status_code=413)
+        data = await request.body()
+        if not data:
+            return JSONResponse({"error": "空文件"}, status_code=400)
+        if len(data) > limit:
+            return JSONResponse({"error": "文件超过 20MB"}, status_code=413)
+        raw = Path(filename).name
+        suffix = Path(raw).suffix[:16]
+        stem = re.sub(r"[^\w.\- ]+", "_", Path(raw).stem)[:120] or "dropped"
+        target_dir = Path(root) / ".agent" / "attachments"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target = target_dir / f"{stem}{suffix}"
+        index = 1
+        while True:
+            try:
+                with target.open("xb") as fh:      # O_EXCL：不覆盖、无竞态
+                    fh.write(data)
+                break
+            except FileExistsError:
+                target = target_dir / f"{stem}-{index}{suffix}"
+                index += 1
+        return JSONResponse({"path": target.relative_to(Path(root)).as_posix(),
+                             "bytes": len(data)})
+
+    @app.get("/api/skills")
+    async def api_skills(project: str = Query(...), token: str = Query("")) -> JSONResponse:
+        """可用技能列表（项目级优先）。"""
+        if not _token_ok(token):
+            return JSONResponse({"error": "未授权"}, status_code=401)
+        from ..core.skills import list_skills
+
+        root = orchestrator.project_root(project)
+        if root is None:
+            return JSONResponse({"error": f"项目不存在: {project}"}, status_code=404)
+        return JSONResponse({"skills": list_skills(root)})
 
     @app.get("/api/timeline")
     async def api_timeline(session: str = Query(...), token: str = Query("")) -> JSONResponse:
@@ -233,6 +298,55 @@ def _session_context(orchestrator, session: str) -> dict | None:
     if conv is None:
         return None
     return conv.context_payload()
+
+
+_MENTION_IGNORE_DIRS = {
+    ".git", ".venv", "venv", "node_modules", "__pycache__", ".pytest_cache",
+    ".ruff_cache", ".mypy_cache", "dist", "build", ".idea", ".vscode", ".cache",
+}
+
+
+def list_project_files(root: Path, query: str = "", limit: int = 200) -> list[str]:
+    """给 @ 提示用的路径清单：跳过重目录，按前缀/子串相关度排序。
+
+    query 为空时只列根目录直接子项（避免一次吐上万条）。
+    """
+    root = Path(root)
+    query = (query or "").strip().lower()
+    results: list[tuple[int, int, str]] = []
+    visited = 0
+    if not query:
+        try:
+            entries = sorted(os.listdir(root))
+        except OSError:
+            return []
+        for name in entries[:limit]:
+            full = root / name
+            suffix = "/" if full.is_dir() else ""
+            if name in _MENTION_IGNORE_DIRS and full.is_dir():
+                continue
+            results.append((0, len(name), f"{name}{suffix}"))
+        return [r[2] for r in results]
+
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in _MENTION_IGNORE_DIRS]
+        visited += len(dirnames) + len(filenames)
+        rel_dir = os.path.relpath(dirpath, root)
+        prefix = "" if rel_dir == "." else f"{rel_dir}/"
+        for name in dirnames:
+            rel = f"{prefix}{name}/"
+            if query in rel.lower():
+                results.append((0 if rel.lower().startswith(query) else 1, len(rel), rel))
+        for name in filenames:
+            rel = f"{prefix}{name}"
+            low = rel.lower()
+            if query in low:
+                results.append((0 if low.startswith(query) else 1, len(rel), rel))
+        if visited > 20000 or len(results) > limit * 5:
+            break
+    results.sort(key=lambda r: (r[0], r[1], r[2]))
+    return [r[2] for r in results[:limit]]
+
 
 
 async def _call_read_tool(orchestrator, project: str, tool: str, args: dict) -> JSONResponse:

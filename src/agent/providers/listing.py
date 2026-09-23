@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import httpx2
 
-from .base import ModelCapability
+from .base import ModelCapability, is_opencode_host
 
 ANTHROPIC_VERSION = "2023-06-01"
 
@@ -141,10 +141,14 @@ async def fetch_models(
     *,
     timeout: float = 10.0,
     client: object | None = None,
+    session_id: str | None = None,
 ) -> list[dict]:
     """获取并结构化模型列表；失败抛 ModelListingError（不静默回退、不伪造）。"""
     url = model_list_url(protocol, base_url)  # 可能抛 Unsupported
     headers = {"Accept": "application/json"}
+    if is_opencode_host(base_url):
+        headers["User-Agent"] = "rabbit-agent/0.1"
+        headers["x-opencode-session"] = session_id or "rabbit-list"
     if api_key:
         if protocol == "anthropic":
             headers["x-api-key"] = api_key
@@ -238,5 +242,8 @@ def merge_capability(
             user.max_output if user else None, metadata.max_output if metadata else None
         ),
         tools=first(user.tools if user else None, metadata.tools if metadata else None),
+        interleaved=first(
+            user.interleaved if user else None, metadata.interleaved if metadata else None
+        ),
         source=source_name,
     )

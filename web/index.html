@@ -30,6 +30,9 @@
         <textarea id="input" rows="2" placeholder="随便问点什么…（Enter 发送，Shift+Enter 换行）"></textarea>
         <div class="composer-controls">
           <div class="menu-wrap">
+            <button id="btn-plus" class="text-select plus-btn" title="更多（命令 / 上下文）">+</button>
+          </div>
+          <div class="menu-wrap">
             <button id="btn-plan-mode" class="text-select" title="plan 模式">
               <span id="plan-label">Build</span><span class="caret" aria-hidden="true"></span>
             </button>
@@ -104,6 +107,28 @@
   </aside>
 </div>
 
+<div id="mention-menu" class="menu hidden"></div>
+<div id="popup-menu" class="menu hidden"></div>
+
+<div id="import-modal-mask" class="hidden">
+  <div id="import-modal">
+    <div class="modal-head">
+      <h3>导入 Codex 会话</h3>
+      <span class="spacer"></span>
+      <button id="import-close" title="关闭">✕</button>
+    </div>
+    <p class="hint">输入 Codex 会话 id（rollout 文件名里的那段 uuid）。只导入对话内容。</p>
+    <label><span>会话 id</span>
+      <input id="import-id" placeholder="01a034c4-db7a-7e70-92c6-8fb5993e03dc" autocomplete="off">
+    </label>
+    <div class="modal-buttons">
+      <button id="import-cancel">取消</button>
+      <button id="import-submit" class="primary">导入</button>
+    </div>
+    <div id="import-result" class="hint"></div>
+  </div>
+</div>
+
 <div id="modal-mask" class="hidden">
   <div id="modal">
     <h3>设置</h3>
@@ -157,7 +182,6 @@
 <div id="key-modal-mask" class="hidden">
   <div id="key-modal">
     <div class="modal-head">
-      <button id="key-back" title="返回">←</button>
       <h3 id="key-title">连接服务商</h3>
       <span class="spacer"></span>
       <button id="key-close" title="关闭">✕</button>

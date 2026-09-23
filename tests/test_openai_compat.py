@@ -148,6 +148,46 @@ async def test_tool_calls_accumulated_and_tools_serialized() -> None:
     ]
 
 
+async def test_interleaved_reasoning_echoed_for_assistant_messages() -> None:
+    """目录声明 interleaved 的模型：assistant 消息按字段回传思考，否则网关 400。"""
+    captured: list[httpx2.Request] = []
+    client = httpx2.AsyncClient(
+        transport=httpx2.MockTransport(
+            capture(sse_handler(sse(chunk({"content": "ok"}, finish="stop"), "[DONE]")), captured)
+        )
+    )
+    provider = OpenAICompatProvider(
+        base_url=BASE, api_key="sk-test", model="m", http_client=client,
+        echo_reasoning_field="reasoning_content",
+    )
+    await provider.chat(
+        [
+            Message(
+                role="assistant", content="",
+                tool_calls=[ToolCall(id="call_1", name="f", arguments={})],
+                reasoning="思考一",
+            ),
+            Message(role="tool", content="结果", tool_call_id="call_1"),
+            Message(role="assistant", content="答复", reasoning="思考二"),
+        ]
+    )
+
+    messages = json.loads(captured[0].content)["messages"]
+    assert messages[0]["reasoning_content"] == "思考一"
+    assert messages[2]["reasoning_content"] == "思考二"
+
+
+async def test_interleaved_reasoning_omitted_without_declaration() -> None:
+    captured: list[httpx2.Request] = []
+    provider = make_provider(
+        capture(sse_handler(sse(chunk({"content": "ok"}, finish="stop"), "[DONE]")), captured)
+    )
+    await provider.chat([Message(role="assistant", content="答复", reasoning="思考")])
+
+    messages = json.loads(captured[0].content)["messages"]
+    assert "reasoning_content" not in messages[0]
+
+
 async def test_message_conversion() -> None:
     captured: list[httpx2.Request] = []
     provider = make_provider(
@@ -242,3 +282,87 @@ async def test_malformed_tool_arguments_raise_provider_error() -> None:
     )
     with pytest.raises(ProviderError, match="JSON"):
         await make_provider(sse_handler(body)).chat([Message(role="user", content="x")])
+
+
+def test_is_opencode_host_matches_only_opencode() -> None:
+    from agent.providers.base import is_opencode_host
+
+    assert is_opencode_host("https://opencode.ai/zen/go/v1") is True
+    assert is_opencode_host("https://api.opencode.ai/v1") is True
+    assert is_opencode_host("https://api.deepseek.com/v1") is False
+    assert is_opencode_host("https://fakeopencode.ai/v1") is False
+    assert is_opencode_host(None) is False
+    assert is_opencode_host("not a url") is False
+
+
+async def test_opencode_host_sends_session_and_ua() -> None:
+    """OpenCode Go 网关要求：自定义 UA + 每会话稳定的 x-opencode-session。"""
+    seen: dict = {}
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        seen["ua"] = request.headers.get("user-agent")
+        seen["sid"] = request.headers.get("x-opencode-session")
+        return httpx2.Response(
+            200,
+            content=sse(chunk({"role": "assistant", "content": "你好"}), chunk({}, "stop")),
+            headers=SSE_HEADERS,
+        )
+
+    client = httpx2.AsyncClient(transport=httpx2.MockTransport(handler))
+    provider = OpenAICompatProvider(
+        base_url="https://opencode.ai/zen/go/v1", api_key="sk-go",
+        model="deepseek-v4.1-flash", http_client=client,
+    )
+    result = await provider.chat([Message(role="user", content="ping")], session_id="sess-42")
+
+    assert result.text == "你好"
+    assert seen["sid"] == "sess-42"
+    assert seen["ua"] and "rabbit-agent" in seen["ua"]
+
+
+async def test_non_opencode_host_sends_no_session_header() -> None:
+    seen: dict = {}
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        seen["sid"] = request.headers.get("x-opencode-session")
+        return httpx2.Response(
+            200,
+            content=sse(chunk({"role": "assistant", "content": "ok"}), chunk({}, "stop")),
+            headers=SSE_HEADERS,
+        )
+
+    client = httpx2.AsyncClient(transport=httpx2.MockTransport(handler))
+    provider = OpenAICompatProvider(
+        base_url="https://api.deepseek.com/v1", api_key="sk-d",
+        model="deepseek-flash", http_client=client,
+    )
+    await provider.chat([Message(role="user", content="ping")], session_id="sess-1")
+
+    assert seen["sid"] is None
+
+
+async def test_opencode_session_fallback_stable_per_instance() -> None:
+    """不传 session_id（如连接 ping/压缩兜底）时用实例级 fallback：实例内稳定、实例间不同。"""
+    def make(handler_calls: list):
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            handler_calls.append(request.headers.get("x-opencode-session"))
+            return httpx2.Response(
+                200,
+                content=sse(chunk({"role": "assistant", "content": "ok"}), chunk({}, "stop")),
+                headers=SSE_HEADERS,
+            )
+        client = httpx2.AsyncClient(transport=httpx2.MockTransport(handler))
+        return OpenAICompatProvider(
+            base_url="https://opencode.ai/zen/go/v1", api_key="sk-go",
+            model="m", http_client=client,
+        )
+
+    calls_a: list = []
+    provider_a = make(calls_a)
+    await provider_a.chat([Message(role="user", content="1")])
+    await provider_a.chat([Message(role="user", content="2")])
+    assert calls_a[0] and calls_a[0] == calls_a[1]        # 实例内稳定
+
+    calls_b: list = []
+    await make(calls_b).chat([Message(role="user", content="1")])
+    assert calls_b[0] != calls_a[0]                         # 实例间不同

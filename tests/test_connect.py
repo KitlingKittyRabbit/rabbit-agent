@@ -2420,6 +2420,67 @@ async def test_catalog_endpoint_match_uses_path_not_just_host(tmp_path: Path) ->
     assert orch.provider_status()["roles"]["main"]["window"] == 222
 
 
+async def test_activate_rebuild_passes_interleaved(tmp_path: Path) -> None:
+    """重建路径（_build_instance）也必须把目录 interleaved 传给 provider。"""
+    base = "https://api.example.com/v1"
+    fixture = {
+        "thinking-api": {"api": base, "models": {"m": {
+            "reasoning": True, "interleaved": {"field": "reasoning_content"},
+            "limit": {"context": 1_000}}}},
+    }
+
+    async def fetcher():
+        return fixture
+
+    seen: list[dict] = []
+
+    def factory(**kw):
+        seen.append(kw)
+        fake = FakeProvider([ChatResult(text="pong")])
+        fake.models = [{"id": "m", "capability": {}}]
+        return fake
+
+    orch = make_orchestrator(tmp_path, factory)
+    orch.providers._catalog_data = {"providers": fixture}
+    orch.providers._catalog_fetcher = fetcher
+    result = await orch.connect_provider("main", protocol="openai", base_url=base,
+                                         model="m", api_key="sk-k")
+    assert result["ok"] is True, result
+    orch.providers._instances.clear()  # 模拟实例重建路径
+    seen.clear()
+    orch.providers._activate("main")
+    assert seen and seen[-1].get("echo_reasoning_field") == "reasoning_content"
+
+
+async def test_catalog_interleaved_reaches_provider_factory(tmp_path: Path) -> None:
+    """目录声明 interleaved 的模型：字段名必须传到 provider（否则下一轮 400）。"""
+    base = "https://api.example.com/v1"
+    fixture = {
+        "thinking-api": {"api": base, "models": {"m": {
+            "reasoning": True, "interleaved": {"field": "reasoning_content"},
+            "limit": {"context": 1_000}}}},
+    }
+
+    async def fetcher():
+        return fixture
+
+    seen: list[dict] = []
+
+    def factory(**kw):
+        seen.append(kw)
+        fake = FakeProvider([ChatResult(text="pong")])
+        fake.models = [{"id": "m", "capability": {}}]
+        return fake
+
+    orch = make_orchestrator(tmp_path, factory)
+    orch.providers._catalog_data = {"providers": fixture}
+    orch.providers._catalog_fetcher = fetcher
+    result = await orch.connect_provider("main", protocol="openai", base_url=base,
+                                         model="m", api_key="sk-k")
+    assert result["ok"] is True, result
+    assert seen and seen[-1].get("echo_reasoning_field") == "reasoning_content"
+
+
 async def test_catalog_capability_skips_candidate_without_model(tmp_path: Path) -> None:
     """回归（审核 V2）：同端点多候选时按"谁真含该模型"回溯，首个命中不得遮蔽。"""
     base = "https://api.example.com/v1"
@@ -2585,3 +2646,35 @@ async def test_disconnect_local_endpoint_keeps_role_usable(tmp_path: Path) -> No
     assert orch.main_provider is fake                     # 本地端点仍可用
     entry = next(p for p in orch.provider_status()["providers"] if p["id"] == pid)
     assert entry["has_key"] is False and entry["configured"] is True
+
+
+def test_chatgpt_login_preset() -> None:
+    """ChatGPT 会员登录预设：Codex Responses 协议、不要 key、带登录标记。"""
+    spec = PRESETS["chatgpt"]
+    assert spec["protocol"] == "openai-responses"
+    assert spec["base_url"] == "https://chatgpt.com/backend-api/codex"
+    assert spec["needs_key"] is False
+    assert spec["login"] == "codex"
+
+
+def test_codex_endpoint_needs_no_api_key() -> None:
+    from agent.core.provider_manager import ProviderManager
+
+    fake = ProviderManager.__new__(ProviderManager)
+    assert fake._endpoint_needs_key(
+        {"base_url": "https://chatgpt.com/backend-api/codex"}) is False
+    assert fake._endpoint_needs_key({"base_url": "https://api.openai.com/v1"}) is True
+
+
+async def test_connect_chatgpt_without_login_is_explicit(tmp_path: Path) -> None:
+    """未登录时连接：报"尚未登录"而不是"缺少 API key"。"""
+    from agent.core.config import make_provider
+
+    orch = make_orchestrator(tmp_path, make_provider)
+    result = await orch.connect_provider(
+        "", protocol="openai-responses",
+        base_url="https://chatgpt.com/backend-api/codex", model="gpt-5.2-codex",
+        api_key="", preset="chatgpt",
+    )
+    assert result["ok"] is False
+    assert "尚未登录" in result["message"] and "缺少 API key" not in result["message"]

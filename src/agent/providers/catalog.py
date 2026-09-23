@@ -137,8 +137,10 @@ def capability_from_catalog(entry: dict, protocol: str) -> ModelCapability:
             mode = "fixed"
             levels = ()
     interleaved = entry.get("interleaved")
+    interleaved_field: str | None = None
     reasoning_returned = None
     if isinstance(interleaved, dict) and interleaved.get("field"):
+        interleaved_field = str(interleaved["field"])
         reasoning_returned = True
     elif protocol == "anthropic" and reasoning is True:
         reasoning_returned = True
@@ -150,5 +152,6 @@ def capability_from_catalog(entry: dict, protocol: str) -> ModelCapability:
         levels=levels,
         max_output=max_output,
         tools=tools,
+        interleaved=interleaved_field,
         source="catalog",
     )
