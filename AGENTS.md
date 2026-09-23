@@ -10,7 +10,8 @@
   - 开始前，主 agent 一次性给出：Issue 语义摘要（目标/背景/范围/非目标/验收）+ 方案 + 复杂度 + 测试计划。
   - 用户一次批准后，即授权后续环节自动推进到 Merge 前，无需逐步重复审批：
     Tiger 创建 Issue / 拉取同步 → 执行者实施并测试 → Rabbit 提交、Push、创建 PR →
-    主 agent 自审 → Tiger Review 及原范围内的修正。
+    主 agent 自审 → Tiger Review 及原范围内的修正；
+    用户批准 Merge 后由 Rabbit 执行 Merge，再由 Tiger 拉取同步。
   - 只有出现以下情况才中断并重新请示：范围扩大、关键歧义、新增未申明的复杂度、
     重大测试失败、新增高风险动作。
   - 本条的一次开始审批即等同"落盘前批准"，两者一致，不逐步重复审批。
@@ -34,15 +35,15 @@
 ## 规则五：账号职责与 GitHub/Git 操作
 
 - 账号职责固定，不得反转：
-  - KitlingKittyRabbit：实现提交、Push、创建/更新 PR
-  - KitlingKittyTiger：创建 Issue、拉取同步、Review/Approve/Request changes/Merge
+  - KitlingKittyRabbit：实现提交、Push、创建/更新 PR；在用户明确批准 Merge 且 Tiger Review 通过后执行 Merge
+  - KitlingKittyTiger：创建 Issue、拉取同步、Review/Approve/Request changes
 - 每次 gh_command / git_remote 都必须显式指定 user；禁止 gh auth switch。
 - 不得按仓库主人推断 reviewer。
 
 ## 规则六：Merge 前二次审批与合并方式
 
 - Merge 前，主 agent 须报告：Issue/PR、改动、测试/CI、Review 结论、风险、建议的 merge 方式及理由。
-- 用户明确批准后，才由 Tiger 执行 merge 并拉取。
+- 用户明确批准后，由 Rabbit 执行 merge；merge 完成后由 Tiger 拉取同步。
 - merge 方式逐 PR 选择，不得静默选择：
   - squash：单一逻辑改动、修复提交多；
   - rebase：提交独立且需线性历史；
