@@ -279,7 +279,95 @@ async def test_self_heal_requires_history_reasoning() -> None:
     provider = make_provider(handler)
     with pytest.raises(ProviderError):
         await provider.chat([Message(role="user", content="没有思考历史")])
-    assert len(calls) == 1  # 无历史 reasoning：不伪造、不重试
+    assert len(calls) == 1  # 无历史 reasoning/tool_calls：不伪造、不重试
+
+
+async def test_echo_mode_includes_empty_reasoning_for_all_assistant() -> None:
+    """回传模式启用：assistant 全带字段；有 reasoning 用原文，无 reasoning 用空串。"""
+    captured: list[httpx2.Request] = []
+    client = httpx2.AsyncClient(
+        transport=httpx2.MockTransport(
+            capture(sse_handler(sse(chunk({"content": "ok"}, finish="stop"), "[DONE]")), captured)
+        )
+    )
+    provider = OpenAICompatProvider(
+        base_url=BASE, api_key="sk-test", model="m", http_client=client,
+        echo_reasoning_field="reasoning_content",
+    )
+    await provider.chat(
+        [
+            Message(role="assistant", content="答复", reasoning="真实思考"),
+            Message(
+                role="assistant", content="",
+                tool_calls=[ToolCall(id="t1", name="f", arguments={})],
+            ),
+            Message(role="assistant", content="普通回复"),
+        ]
+    )
+
+    messages = json.loads(captured[0].content)["messages"]
+    assert messages[0]["reasoning_content"] == "真实思考"  # 有 reasoning 回原文
+    assert messages[1]["reasoning_content"] == ""          # 无 reasoning 给空串
+    assert messages[2]["reasoning_content"] == ""
+
+
+async def test_self_heal_fills_empty_reasoning_for_tool_calls() -> None:
+    """tool_calls 但 reasoning=None：自愈第二次请求带 reasoning_content=''（不伪造内容）。"""
+    calls: list[httpx2.Request] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        calls.append(request)
+        if len(calls) == 1:
+            return httpx2.Response(400, json={"error": {"message": EXACT_ROUNDTRIP_ERROR}})
+        return httpx2.Response(
+            200,
+            headers=SSE_HEADERS,
+            content=sse(chunk({"content": "ok"}, finish="stop"), "[DONE]"),
+        )
+
+    provider = make_provider(handler)
+    result = await provider.chat(
+        [
+            Message(
+                role="assistant", content="",
+                tool_calls=[ToolCall(id="t1", name="f", arguments={})],
+            ),
+            Message(role="tool", content="结果", tool_call_id="t1"),
+        ]
+    )
+
+    assert result.text == "ok"
+    assert len(calls) == 2
+    second = json.loads(calls[1].content)["messages"]
+    assert second[0]["reasoning_content"] == ""
+    assert second[0]["tool_calls"][0]["id"] == "t1"  # 原有结构不变
+
+
+async def test_self_heal_triggers_with_empty_reasoning_only() -> None:
+    """历史全部是空 reasoning 的 tool_calls：也能触发自愈；第二次仍 400 则停止。"""
+    calls: list[httpx2.Request] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        calls.append(request)
+        return httpx2.Response(400, json={"error": {"message": EXACT_ROUNDTRIP_ERROR}})
+
+    provider = make_provider(handler)
+    with pytest.raises(ProviderError):
+        await provider.chat(
+            [
+                Message(
+                    role="assistant", content="",
+                    tool_calls=[ToolCall(id="t1", name="f", arguments={})],
+                ),
+                Message(role="tool", content="结果1", tool_call_id="t1"),
+                Message(
+                    role="assistant", content="",
+                    tool_calls=[ToolCall(id="t2", name="f", arguments={})],
+                ),
+                Message(role="tool", content="结果2", tool_call_id="t2"),
+            ]
+        )
+    assert len(calls) == 2  # 触发一次自愈；仍 400 即停，不无限重试
 
 
 async def test_self_heal_retries_at_most_once_and_leaks_nothing() -> None:

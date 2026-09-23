@@ -102,10 +102,10 @@ class OpenAICompatProvider:
     def _can_self_heal_reasoning(
         self, messages: Sequence[Message], error: ProviderError
     ) -> bool:
-        """仅当精确错误 + 确有未标注字段的历史 reasoning + 当前未回传时允许自愈。
+        """仅当精确错误 + 历史存在未标注字段的 reasoning/tool_calls + 当前未回传时允许自愈。
 
         - 其它 400 一律不重试；
-        - 历史没有 reasoning 不重试（绝不伪造思考文本）；
+        - 历史既无 reasoning 也无 tool_calls 不重试（绝不伪造思考文本）；
         - 已经在回传（实例字段或消息元数据）不重试（重试无意义，防循环）。
         """
         if self._echo_reasoning_field or error.status_code != 400:
@@ -114,7 +114,10 @@ class OpenAICompatProvider:
         if "reasoning_content" not in text or "passed back" not in text:
             return False
         return any(
-            m.role == "assistant" and m.reasoning and not m.reasoning_field for m in messages
+            m.role == "assistant"
+            and not m.reasoning_field
+            and (m.reasoning or m.tool_calls)
+            for m in messages
         )
 
     async def _chat_once(
@@ -181,8 +184,9 @@ class OpenAICompatProvider:
         else:
             payload = {"role": message.role, "content": message.content}
         field = message.reasoning_field or self._echo_reasoning_field
-        if field and message.role == "assistant" and message.reasoning:
-            payload[field] = message.reasoning
+        if field and message.role == "assistant":
+            # thinking 回传模式：所有历史 assistant 都带字段；无思考给空串（不伪造内容）
+            payload[field] = message.reasoning or ""
         return payload
 
     @staticmethod
