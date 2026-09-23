@@ -85,6 +85,58 @@ async def test_executor_context_persists_across_restart(tmp_path: Path) -> None:
     assert contents[-1] == "任务二"
 
 
+async def test_executor_reasoning_field_persists_across_restart(tmp_path: Path) -> None:
+    """执行者持久上下文：reasoning 的字段元数据入库，重启后下个任务仍按元数据回传。"""
+    (tmp_path / "a.txt").write_text("文件内容", encoding="utf-8")
+    store_path = tmp_path / "s.db"
+    store = SessionStore(store_path)
+    executor = FakeProvider([
+        ChatResult(
+            tool_calls=[ToolCall(id="t1", name="read_file", arguments={"path": "a.txt"})],
+            stop_reason="tool_use", reasoning="先读文件",
+            reasoning_field="reasoning_content",
+        ),
+        ChatResult(text="任务一完成"),
+    ])
+    orch = make_orch(tmp_path, FakeProvider([ChatResult(text="x")]), executor, store=store)
+    conv = orch.conversations[_sid(orch)]
+    await orch.start()
+    try:
+        conv._dispatcher.dispatch("任务一")
+        await _wait(lambda: conv._dispatcher.tasks.get(1) == "done")
+    finally:
+        await orch.stop()
+        store.close()
+
+    reloaded = SessionStore(store_path)
+    try:
+        assistant = next(
+            m for m in reloaded.load(conv.id, "executor")
+            if m.role == "assistant" and m.reasoning
+        )
+        assert assistant.reasoning == "先读文件"
+        assert assistant.reasoning_field == "reasoning_content"
+    finally:
+        reloaded.close()
+
+    # 重启后下个任务：旧 assistant 消息（含字段元数据）完整进入请求历史
+    executor2 = FakeProvider([ChatResult(text="任务二完成")])
+    orch2 = make_orch(tmp_path, FakeProvider([ChatResult(text="x")]), executor2,
+                      store=SessionStore(store_path))
+    conv2 = orch2.conversations[_sid(orch2)]
+    await orch2.start()
+    try:
+        conv2._dispatcher.dispatch("任务二")
+        await _wait(lambda: conv2._dispatcher.tasks.get(2) == "done")
+    finally:
+        await orch2.stop()
+    old = next(
+        m for m in executor2.calls[0][0]
+        if m.role == "assistant" and m.reasoning == "先读文件"
+    )
+    assert old.reasoning_field == "reasoning_content"
+
+
 async def test_steering_message_reaches_next_model_round(tmp_path: Path) -> None:
     """执行中插话：下一个模型回合就看到（不新建任务）。"""
     (tmp_path / "a.txt").write_text("文件内容", encoding="utf-8")

@@ -174,6 +174,8 @@ async def test_interleaved_reasoning_echoed_for_assistant_messages() -> None:
 
     messages = json.loads(captured[0].content)["messages"]
     assert messages[0]["reasoning_content"] == "思考一"
+    assert messages[1]["role"] == "tool"  # 顺序：assistant(工具调用) → tool 结果
+    assert "tool_calls" in messages[0]
     assert messages[2]["reasoning_content"] == "思考二"
 
 
@@ -186,6 +188,112 @@ async def test_interleaved_reasoning_omitted_without_declaration() -> None:
 
     messages = json.loads(captured[0].content)["messages"]
     assert "reasoning_content" not in messages[0]
+
+
+async def test_consume_records_reasoning_field() -> None:
+    """流里实际返回的 reasoning 字段名要记录下来，供下一轮按消息元数据回传。"""
+    body = sse(
+        chunk({"reasoning_content": "想"}),
+        chunk({"content": "答"}, finish="stop"),
+        "[DONE]",
+    )
+    result = await make_provider(sse_handler(body)).chat([Message(role="user", content="x")])
+    assert result.reasoning == "想"
+    assert result.reasoning_field == "reasoning_content"
+
+
+async def test_consume_without_reasoning_has_no_field() -> None:
+    body = sse(chunk({"content": "答"}, finish="stop"), "[DONE]")
+    result = await make_provider(sse_handler(body)).chat([Message(role="user", content="x")])
+    assert result.reasoning_field is None
+
+
+async def test_reasoning_field_metadata_echoed_without_instance_config() -> None:
+    """Provider 重建/无目录能力时，消息自带的字段元数据仍能驱动回传。"""
+    captured: list[httpx2.Request] = []
+    provider = make_provider(
+        capture(sse_handler(sse(chunk({"content": "ok"}, finish="stop"), "[DONE]")), captured)
+    )
+    await provider.chat(
+        [
+            Message(
+                role="assistant", content="答复", reasoning="思考",
+                reasoning_field="reasoning_content",
+            )
+        ]
+    )
+
+    messages = json.loads(captured[0].content)["messages"]
+    assert messages[0]["reasoning_content"] == "思考"
+
+
+EXACT_ROUNDTRIP_ERROR = (
+    "The `reasoning_content` in the thinking mode must be passed back to the API."
+)
+
+
+async def test_self_heal_on_exact_reasoning_400() -> None:
+    """旧消息只有 reasoning、没有字段元数据：精确 400 时补字段重试一次并记住。"""
+    calls: list[httpx2.Request] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        calls.append(request)
+        if len(calls) == 1:
+            return httpx2.Response(400, json={"error": {"message": EXACT_ROUNDTRIP_ERROR}})
+        return httpx2.Response(
+            200,
+            headers=SSE_HEADERS,
+            content=sse(chunk({"content": "ok"}, finish="stop"), "[DONE]"),
+        )
+
+    provider = make_provider(handler)
+    result = await provider.chat([Message(role="assistant", content="答复", reasoning="秘密思考")])
+
+    assert result.text == "ok"
+    assert len(calls) == 2
+    second = json.loads(calls[1].content)["messages"]
+    assert second[0]["reasoning_content"] == "秘密思考"
+    assert provider._echo_reasoning_field == "reasoning_content"  # 实例记住
+
+
+async def test_self_heal_not_triggered_for_other_400() -> None:
+    calls: list[httpx2.Request] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        calls.append(request)
+        return httpx2.Response(400, json={"error": {"message": "invalid model"}})
+
+    provider = make_provider(handler)
+    with pytest.raises(ProviderError):
+        await provider.chat([Message(role="assistant", content="答复", reasoning="思考")])
+    assert len(calls) == 1  # 非目标 400 不重试
+
+
+async def test_self_heal_requires_history_reasoning() -> None:
+    calls: list[httpx2.Request] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        calls.append(request)
+        return httpx2.Response(400, json={"error": {"message": EXACT_ROUNDTRIP_ERROR}})
+
+    provider = make_provider(handler)
+    with pytest.raises(ProviderError):
+        await provider.chat([Message(role="user", content="没有思考历史")])
+    assert len(calls) == 1  # 无历史 reasoning：不伪造、不重试
+
+
+async def test_self_heal_retries_at_most_once_and_leaks_nothing() -> None:
+    calls: list[httpx2.Request] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        calls.append(request)
+        return httpx2.Response(400, json={"error": {"message": EXACT_ROUNDTRIP_ERROR}})
+
+    provider = make_provider(handler)
+    with pytest.raises(ProviderError) as exc_info:
+        await provider.chat([Message(role="assistant", content="答复", reasoning="秘密思考")])
+    assert len(calls) == 2  # 严格最多一次重试
+    assert "秘密思考" not in str(exc_info.value)  # 错误文本不泄漏思考原文
 
 
 async def test_message_conversion() -> None:
@@ -216,6 +324,7 @@ async def test_message_conversion() -> None:
     assert tool_call["function"]["name"] == "f"
     assert json.loads(tool_call["function"]["arguments"]) == {"a": 1}
     assert messages[3] == {"role": "tool", "tool_call_id": "call_1", "content": "结果"}
+    assert "reasoning_content" not in messages[2]  # 普通请求不新增未知字段
 
 
 @pytest.mark.parametrize(("status", "error"), [(401, AuthError), (429, RateLimitError)])

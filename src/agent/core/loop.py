@@ -114,6 +114,7 @@ class AgentLoop:
                     content=result.text,
                     tool_calls=result.tool_calls or None,
                     reasoning=result.reasoning or None,
+                    reasoning_field=result.reasoning_field or None,
                     content_blocks=result.blocks or None,
                 )
             )

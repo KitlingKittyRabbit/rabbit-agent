@@ -23,7 +23,9 @@ class ToolCall:
 class Message:
     """对话消息。tool_calls 仅 assistant 使用；tool_call_id 仅 tool 使用。
 
-    reasoning 仅本地展示；content_blocks 保存 provider 原始有序内容块
+    reasoning 仅本地展示；reasoning_field 记录该 reasoning 实际来自哪个协议字段
+    （如 reasoning_content），下一轮按消息自身元数据回传，不依赖当前 provider 配置；
+    content_blocks 保存 provider 原始有序内容块
     （Anthropic thinking[含 signature]/text/tool_use），下一轮按协议原样回传。
     """
 
@@ -32,6 +34,7 @@ class Message:
     tool_calls: list[ToolCall] | None = None
     tool_call_id: str | None = None
     reasoning: str | None = None
+    reasoning_field: str | None = None
     content_blocks: list[dict] | None = None
 
 
@@ -91,6 +94,7 @@ class ChatResult:
     stop_reason: str = "stop"
     usage: Usage = field(default_factory=Usage)
     reasoning: str = ""
+    reasoning_field: str | None = None  # 实际返回 reasoning 的协议字段名（如 reasoning_content）
     reasoning_blocks: list[dict] = field(default_factory=list)
     blocks: list[dict] = field(default_factory=list)  # 原始有序内容块（协议回传用）
 

@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS messages (
     tool_calls TEXT,
     tool_call_id TEXT,
     reasoning TEXT,
+    reasoning_field TEXT,
     content_blocks TEXT,
     stream TEXT NOT NULL DEFAULT 'main'
 );
@@ -90,7 +91,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
     if cols:
         if "stream" not in cols:
             conn.execute("ALTER TABLE messages ADD COLUMN stream TEXT NOT NULL DEFAULT 'main'")
-        for column in ("reasoning", "content_blocks"):
+        for column in ("reasoning", "reasoning_field", "content_blocks"):
             if column not in cols:
                 conn.execute(f"ALTER TABLE messages ADD COLUMN {column} TEXT")
     s_cols = [row[1] for row in conn.execute("PRAGMA table_info(sessions)").fetchall()]
@@ -474,7 +475,8 @@ class SessionStore:
     def append(self, session_id: str, messages: list[Message], stream: str = "main") -> None:
         self._conn.executemany(
             "INSERT INTO messages (session_id, role, content, tool_calls, tool_call_id,"
-            " reasoning, content_blocks, stream) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            " reasoning, reasoning_field, content_blocks, stream)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [
                 (
                     session_id,
@@ -487,6 +489,7 @@ class SessionStore:
                     ),
                     m.tool_call_id,
                     m.reasoning,
+                    m.reasoning_field,
                     (
                         json.dumps(m.content_blocks, ensure_ascii=False)
                         if m.content_blocks
@@ -521,12 +524,13 @@ class SessionStore:
 
     def load(self, session_id: str, stream: str = "main") -> list[Message]:
         rows = self._conn.execute(
-            "SELECT role, content, tool_calls, tool_call_id, reasoning, content_blocks"
+            "SELECT role, content, tool_calls, tool_call_id, reasoning,"
+            " reasoning_field, content_blocks"
             " FROM messages WHERE session_id = ? AND stream = ? ORDER BY idx",
             (session_id, stream),
         ).fetchall()
         out: list[Message] = []
-        for role, content, tool_calls_json, tool_call_id, reasoning, blocks_json in rows:
+        for role, content, tool_calls_json, tool_call_id, reasoning, field, blocks_json in rows:
             try:
                 parsed_calls = json.loads(tool_calls_json) if tool_calls_json else None
             except (ValueError, TypeError):
@@ -538,6 +542,7 @@ class SessionStore:
                 Message(
                     role=role, content=content, tool_calls=tool_calls,
                     tool_call_id=tool_call_id, reasoning=reasoning,
+                    reasoning_field=field,
                     content_blocks=self._load_blocks(blocks_json),
                 )
             )

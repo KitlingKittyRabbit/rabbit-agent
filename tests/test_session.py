@@ -112,6 +112,49 @@ def test_messages_persist_reasoning_and_content_blocks(tmp_path: Path) -> None:
     store.close()
 
 
+def test_messages_persist_reasoning_field(tmp_path: Path) -> None:
+    """reasoning 的协议字段名随消息入库并恢复（重启后仍能按消息元数据回传）。"""
+    store = SessionStore(tmp_path / "s.db")
+    store.append(
+        "s1",
+        [
+            Message(
+                role="assistant", content="答复", reasoning="思考",
+                reasoning_field="reasoning_content",
+            ),
+            Message(role="assistant", content="普通回复", reasoning="旧思考"),
+        ],
+    )
+    loaded = store.load("s1")
+    assert loaded[0].reasoning_field == "reasoning_content"
+    assert loaded[1].reasoning_field is None  # 缺省不伪造
+    store.close()
+
+
+def test_old_messages_table_without_reasoning_field_migrates(tmp_path: Path) -> None:
+    """旧库 messages 表没有 reasoning_field 列：自动补列，旧数据可读不阻塞启动。"""
+    import sqlite3
+
+    db = tmp_path / "s.db"
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "CREATE TABLE messages (idx INTEGER PRIMARY KEY AUTOINCREMENT,"
+        " session_id TEXT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL DEFAULT '',"
+        " tool_calls TEXT, tool_call_id TEXT, reasoning TEXT, content_blocks TEXT,"
+        " stream TEXT NOT NULL DEFAULT 'main')"
+    )
+    conn.execute(
+        "INSERT INTO messages (session_id, role, content, reasoning)"
+        " VALUES ('s1', 'assistant', '答复', '旧思考')"
+    )
+    conn.commit()
+    conn.close()
+    store = SessionStore(db)
+    loaded = store.load("s1")
+    assert loaded[0].reasoning == "旧思考" and loaded[0].reasoning_field is None
+    store.close()
+
+
 def test_messages_invalid_blocks_json_degrades(tmp_path: Path) -> None:
     """坏 JSON 的旧记录安全降级为 None，不阻塞读取。"""
     store = SessionStore(tmp_path / "s.db")

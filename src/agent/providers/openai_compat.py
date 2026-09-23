@@ -89,6 +89,42 @@ class OpenAICompatProvider:
         on_reasoning: OnReasoning | None = None,
         session_id: str | None = None,
     ) -> ChatResult:
+        try:
+            return await self._chat_once(messages, tools, on_text, on_reasoning, session_id)
+        except ProviderError as e:
+            if not self._can_self_heal_reasoning(messages, e):
+                raise
+            # 精确错误（历史 reasoning 未回传）：补字段重试恰好一次，成功后本实例记住。
+            # 旧持久消息只有 reasoning 文本、没有字段元数据时靠这条路径恢复。
+            self._echo_reasoning_field = "reasoning_content"
+            return await self._chat_once(messages, tools, on_text, on_reasoning, session_id)
+
+    def _can_self_heal_reasoning(
+        self, messages: Sequence[Message], error: ProviderError
+    ) -> bool:
+        """仅当精确错误 + 确有未标注字段的历史 reasoning + 当前未回传时允许自愈。
+
+        - 其它 400 一律不重试；
+        - 历史没有 reasoning 不重试（绝不伪造思考文本）；
+        - 已经在回传（实例字段或消息元数据）不重试（重试无意义，防循环）。
+        """
+        if self._echo_reasoning_field or error.status_code != 400:
+            return False
+        text = str(error).lower()
+        if "reasoning_content" not in text or "passed back" not in text:
+            return False
+        return any(
+            m.role == "assistant" and m.reasoning and not m.reasoning_field for m in messages
+        )
+
+    async def _chat_once(
+        self,
+        messages: Sequence[Message],
+        tools: Sequence[ToolSpec] | None,
+        on_text: OnText | None,
+        on_reasoning: OnReasoning | None,
+        session_id: str | None,
+    ) -> ChatResult:
         kwargs: dict = {
             "model": self._model,
             "messages": [self._convert_message(m) for m in messages],
@@ -144,12 +180,9 @@ class OpenAICompatProvider:
             }
         else:
             payload = {"role": message.role, "content": message.content}
-        if (
-            self._echo_reasoning_field
-            and message.role == "assistant"
-            and message.reasoning
-        ):
-            payload[self._echo_reasoning_field] = message.reasoning
+        field = message.reasoning_field or self._echo_reasoning_field
+        if field and message.role == "assistant" and message.reasoning:
+            payload[field] = message.reasoning
         return payload
 
     @staticmethod
@@ -213,6 +246,8 @@ class OpenAICompatProvider:
             stop_reason=_STOP_MAP.get(finish or "stop", "other"),
             usage=usage,
             reasoning="".join(reasoning_parts),
+            # 记录实际字段名：该消息的 reasoning 下一轮必须按此字段回传
+            reasoning_field="reasoning_content" if reasoning_parts else None,
         )
 
     @staticmethod
