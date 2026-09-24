@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import inspect
+import json
 from collections.abc import Callable, Sequence
 
 from ..providers import Message, ToolSpec, Usage
@@ -19,14 +20,24 @@ COMPACT_PROMPT = """把以下对话历史压缩为一份要点摘要，供后续
 SUMMARY_PREFIX = "[前情摘要]"
 
 
-def estimate_chars(messages: list[Message]) -> int:
-    """粗估消息字符数：内容 + 工具调用参数 + 工具结果（tool 消息即结果）。"""
-    total = 0
-    for m in messages:
-        total += len(m.content)
-        for tc in m.tool_calls or []:
-            total += len(tc.name) + len(str(tc.arguments))
+def message_chars(m: Message) -> int:
+    """单条消息的字符量：内容 + 工具调用参数 + 思考 + 协议块（tool 消息即结果）。
+
+    reasoning 与 content_blocks 都会进入真实请求（回传思考 / 协议原样回传），
+    必须计入，否则预算失真、压缩永不触发。
+    """
+    total = len(m.content)
+    for tc in m.tool_calls or []:
+        total += len(tc.name) + len(str(tc.arguments))
+    total += len(m.reasoning or "")
+    for block in m.content_blocks or []:
+        total += len(json.dumps(block, ensure_ascii=False))
     return total
+
+
+def estimate_chars(messages: list[Message]) -> int:
+    """粗估消息字符数：逐条累加（见 message_chars）。"""
+    return sum(message_chars(m) for m in messages)
 
 
 def tool_schema_chars(tool_specs: Sequence[ToolSpec] | None) -> int:
@@ -113,7 +124,7 @@ async def compact_messages(
     size = 0
     while cut > 1 and size < budget_chars:
         m = body[cut - 1]
-        size += len(m.content) + sum(len(str(tc.arguments)) for tc in m.tool_calls or [])
+        size += message_chars(m)
         if size <= budget_chars:
             cut -= 1
     # 切割下界：锚点（当前任务/本回合起点）及其之后的工具链必须留在 recent
