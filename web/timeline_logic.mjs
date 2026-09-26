@@ -104,7 +104,91 @@ export function taskCardLines(task) {
     lastAction: (task && task.last_action) || "",
     stopReason: (task && task.stop_reason) || "",
   });
-  return { title, line };
+  return { title, line, preview: taskCardPreview(task && task.preview) };
+}
+
+/* ---------- 事件分页 / 实时缓冲合并（纯函数，浏览器与 node 共用） ---------- */
+
+export function mergeEventPage(eventsById, pageEvents) {
+  // 按 idx 去重合并到事件表；返回新增条数（分页边界重复事件不会重复渲染）
+  let added = 0;
+  for (const e of pageEvents || []) {
+    if (e && e.idx !== undefined && eventsById[e.idx] === undefined) {
+      eventsById[e.idx] = e;
+      added += 1;
+    }
+  }
+  return added;
+}
+
+export function groupEventsByTurn(events) {
+  // 按 turn 分组：组内按 idx 升序、组间按首事件 idx 升序；无 turn 的归 loose
+  const byTurn = new Map();
+  for (const e of events || []) {
+    const key = (e && e.turn_id !== null && e.turn_id !== undefined) ? e.turn_id : "loose";
+    if (!byTurn.has(key)) byTurn.set(key, []);
+    byTurn.get(key).push(e);
+  }
+  const groups = [];
+  for (const [turnId, list] of byTurn) {
+    list.sort((a, b) => (a.idx ?? 0) - (b.idx ?? 0));
+    groups.push({ turnId, events: list, firstIdx: list[0]?.idx ?? 0 });
+  }
+  groups.sort((a, b) => a.firstIdx - b.firstIdx);
+  return groups;
+}
+
+export function terminalEventLoaded(events) {
+  return (events || []).some((e) =>
+    e.type === "turn_completed" || e.type === "turn_cancelled" || e.type === "turn_failed");
+}
+
+export function mergeLiveState(local, server) {
+  // 实时快照合并（整任务累积：文本/工具分段）：谁内容更长取谁，避免丢在途片段。
+  // server 为空表示任务不在运行：本地缓冲退役（内容已在持久历史里）。
+  if (!server) return null;
+  const base = normalizeLive(server);
+  if (!local || local.task_id !== server.task_id) return base;
+  const mine = normalizeLive(local);
+  if (base.segments.length > mine.segments.length) return base;
+  if (mine.segments.length > base.segments.length) {
+    return {...mine, step: Math.max(base.step, mine.step)};
+  }
+  const segments = mine.segments.map((seg, i) => {
+    const other = base.segments[i];
+    if (!other || seg.kind !== other.kind) return other || seg;
+    if (seg.kind === "text") {
+      return {kind: "text", text: pickLongerText(seg.text || "", other.text || "")};
+    }
+    return other;
+  });
+  return {
+    task_id: base.task_id,
+    step: Math.max(base.step, mine.step),
+    reasoning: pickLongerText(mine.reasoning || "", base.reasoning || ""),
+    segments,
+  };
+}
+
+function normalizeLive(live) {
+  return {
+    task_id: live.task_id,
+    step: live.step ?? 0,
+    reasoning: live.reasoning || "",
+    segments: Array.isArray(live.segments) ? live.segments : [],
+  };
+}
+
+function pickLongerText(a, b) {
+  if (b.startsWith(a)) return b;
+  if (a.startsWith(b)) return a;
+  return b;  // 内容不一致：服务端权威
+}
+
+export function taskCardPreview(text, limit = 120) {
+  const clean = String(text || "").replace(/\s+/g, " ").trim();
+  if (!clean) return "";
+  return clean.length <= limit ? clean : `…${clean.slice(-limit)}`;
 }
 
 export function finalPreview(text, limit = 160) {

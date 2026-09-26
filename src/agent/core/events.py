@@ -44,6 +44,11 @@ TURN_CANCELLED_EVENT = "turn_cancelled"
 TURN_FAILED_EVENT = "turn_failed"
 REASONING_DELTA = "reasoning_delta"  # provider 明确返回的思考增量
 
+# 高频文本片段：写入前按相邻同键（type/actor/turn/task）合并，避免几字符一行落库
+DELTA_EVENT_TYPES = frozenset({
+    REASONING_DELTA, SUBAGENT_TEXT_DELTA, ACTIVITY_TEXT_DELTA, FINAL_TEXT_DELTA,
+})
+
 ACTOR_MAIN = "main"
 ACTOR_SUBAGENT = "subagent"
 ACTOR_SYSTEM = "system"

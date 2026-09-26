@@ -23,6 +23,7 @@ from .events import (
     ACTIVITY_TEXT_DELTA,
     ACTOR_MAIN,
     ACTOR_SUBAGENT,
+    DELTA_EVENT_TYPES,
     FINAL_COMPLETED,
     FINAL_STARTED,
     FINAL_TEXT_DELTA,
@@ -58,6 +59,8 @@ from .prompts import build_main_system
 
 _CONFIRM_TIMEOUT = 120
 _UNSET: object = object()  # _record_event 的 turn_id 未指定哨兵
+_DELTA_FLUSH_SECONDS = 0.15  # 流式片段合并窗口：到点即落库/广播
+_DELTA_FLUSH_CHARS = 4000    # 单条合并事件的最大字符数（超过即切一条）
 
 
 class Conversation:
@@ -116,6 +119,8 @@ class Conversation:
         self._last_prompt_tokens: int | None = None  # 上一次请求的精确 input tokens
         self._last_prompt_epoch: int = -1
         self._epoch: int = 0  # 消息集变更计数（用于判断精确值是否仍适用）
+        self._pending_delta: dict | None = None  # 待合并的流式片段（同键相邻）
+        self._delta_timer: asyncio.TimerHandle | None = None
 
     def _root(self) -> Path:
         """工具沙箱根 = 所属项目路径。"""
@@ -179,6 +184,7 @@ class Conversation:
         self._driver_task = asyncio.create_task(self._driver())
 
     async def shutdown(self) -> None:
+        self._flush_delta()  # 关闭前落库，不丢尾部片段
         self._dispatcher.cancel_all("agent 服务关闭，任务被中断")
         if self._turn_task is not None and not self._turn_task.done():
             self._turn_task.cancel()
@@ -186,6 +192,7 @@ class Conversation:
             self._driver_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._driver_task
+        self._flush_delta()  # 取消过程新产生的片段
 
     # ---------- 外部接口 ----------
 
@@ -220,6 +227,10 @@ class Conversation:
     def executor_inflight(self) -> list[Message]:
         """执行者进行中任务的未持久化消息（供 /api/executor_messages 拼接展示）。"""
         return self._executor.inflight_messages()
+
+    def executor_live(self) -> dict | None:
+        """执行者当前未完成段的实时快照（模型正在生成、尚未成消息的文字/思考）。"""
+        return self._executor.live_snapshot()
 
     _DIRECT_PREFIXES = ("[用户直接对执行者说]\n", "[用户对执行者插话]\n")
 
@@ -257,6 +268,7 @@ class Conversation:
                 await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
         for _ in range(5):
             await asyncio.sleep(0)
+        self._flush_delta()  # 中断落定后落库尾部片段
 
     def undo_supported(self, turn_id: int) -> bool | None:
         store = self._registry.store
@@ -324,16 +336,41 @@ class Conversation:
         """执行事件：持久化到 SessionStore 并广播到事件总线（UI 数据源）。
 
         turn_id 未指定时归属当前 turn；subagent 事件必须显式传固定 parent turn。
+        高频文本片段（DELTA_EVENT_TYPES）先按相邻同键合并，再批量落库与广播：
+        非 delta 事件会先冲刷缓冲，保证工具事件与文本的先后关系不变。
         """
         effective_turn = self._current_turn_id if turn_id is _UNSET else turn_id
+        if type in DELTA_EVENT_TYPES and text:
+            self._buffer_delta(type, actor, effective_turn, task_id, text)
+            return
+        self._flush_delta()
+        self._emit_event(
+            type, actor=actor, turn_id=effective_turn, task_id=task_id, name=name,
+            arguments=arguments, result=result, status=status, text=text,
+        )
+
+    def _emit_event(
+        self,
+        type: str,
+        *,
+        actor: str,
+        turn_id: int | None,
+        task_id: int | None,
+        name: str | None,
+        arguments: str | None,
+        result: str | None,
+        status: str | None,
+        text: str | None,
+    ) -> None:
+        """单条事件的持久化 + 广播（合并缓冲冲刷时也走这里）。"""
         store = self._registry.store
+        event: dict = {"type": type, "session": self.id, "turn_id": turn_id, "actor": actor}
         if store is not None:
-            store.add_event(
+            event["idx"] = store.add_event(
                 self.id, type, time.time(),
-                turn_id=effective_turn, task_id=task_id, actor=actor,
+                turn_id=turn_id, task_id=task_id, actor=actor,
                 name=name, arguments=arguments, result=result, status=status, text=text,
             )
-        event: dict = {"type": type, "session": self.id, "turn_id": effective_turn, "actor": actor}
         if task_id is not None:
             event["task_id"] = task_id
         for key, value in (
@@ -343,6 +380,45 @@ class Conversation:
             if value is not None:
                 event[key] = value
         self._registry.emit(event)
+
+    def _buffer_delta(
+        self, type: str, actor: str, turn_id: int | None, task_id: int | None, text: str
+    ) -> None:
+        """把流式片段并入当前缓冲；键变化或超长时先冲刷再起新缓冲。"""
+        key = (type, actor, turn_id, task_id)
+        pending = self._pending_delta
+        if (pending is not None and pending["key"] == key
+                and len(pending["text"]) < _DELTA_FLUSH_CHARS):
+            pending["text"] += text
+            return
+        self._flush_delta()
+        self._pending_delta = {"key": key, "text": text, "ts": time.time()}
+        self._schedule_delta_flush()
+
+    def _schedule_delta_flush(self) -> None:
+        if self._delta_timer is not None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._flush_delta()  # 无事件循环（同步调用）：立即落库
+            return
+        self._delta_timer = loop.call_later(_DELTA_FLUSH_SECONDS, self._flush_delta)
+
+    def _flush_delta(self) -> None:
+        """冲刷待合并片段（定时/边界/关闭共用）；无缓冲时为空操作。"""
+        if self._delta_timer is not None:
+            self._delta_timer.cancel()
+            self._delta_timer = None
+        pending = self._pending_delta
+        self._pending_delta = None
+        if pending is None:
+            return
+        type, actor, turn_id, task_id = pending["key"]
+        self._emit_event(
+            type, actor=actor, turn_id=turn_id, task_id=task_id, name=None,
+            arguments=None, result=None, status=None, text=pending["text"],
+        )
 
     def _audit_call(self, tool: str, args: dict, phase: str, payload: str | None) -> None:
         self._registry.audit.log(

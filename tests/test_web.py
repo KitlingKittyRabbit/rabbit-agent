@@ -310,8 +310,9 @@ def test_timeline_and_task_api(tmp_path: Path) -> None:
         data = resp.json()
         assert len(data["turns"]) == 1
         assert data["turns"][0]["final_text"] == "完成"
-        assert [e["type"] for e in data["turns"][0]["events"]] == [TOOL_STARTED, SUBAGENT_COMPLETED]
+        assert [e["type"] for e in data["events"]] == [TOOL_STARTED, SUBAGENT_COMPLETED]
         assert data["tasks"][0]["title"] == "任务一"
+        assert data["has_more"] is False and data["before_idx"] is not None
 
         resp = client.get("/api/task", params={"session": "s1", "task": 1})
         assert resp.status_code == 200
@@ -325,7 +326,7 @@ def test_timeline_and_task_api(tmp_path: Path) -> None:
 def test_timeline_and_task_without_store(tmp_path: Path) -> None:
     with TestClient(create_app(make_orch(tmp_path))) as client:
         resp = client.get("/api/timeline", params={"session": "s1"})
-        assert resp.json() == {"turns": [], "tasks": [], "context": None}
+        assert resp.json() == {"turns": [], "events": [], "tasks": [], "context": None}
         assert client.get("/api/task", params={"session": "s1", "task": 1}).status_code == 404
 
 
@@ -530,7 +531,7 @@ def test_migrate_drops_sessions_without_project_id(tmp_path: Path) -> None:
 
 
 async def test_timeline_loose_events_include_user_to_executor(tmp_path: Path) -> None:
-    """无 turn 的会话：直连执行者的灰色提示进入 timeline 的 loose_events（刷新可见）。"""
+    """无 turn 的会话：直连执行者的灰色提示进入 timeline 事件页（刷新可见）。"""
     store = SessionStore(tmp_path / "s.db")
     orch = make_orch(tmp_path, store=store)
     conv = next(iter(orch.conversations.values()))
@@ -538,6 +539,48 @@ async def test_timeline_loose_events_include_user_to_executor(tmp_path: Path) ->
     with TestClient(create_app(orch)) as client:
         resp = client.get(f"/api/timeline?session={conv.id}")
         data = resp.json()
-    loose = [e for e in data.get("loose_events", []) if e["type"] == "user_to_executor"]
+    loose = [e for e in data.get("events", []) if e["type"] == "user_to_executor"]
     assert loose and loose[0]["turn_id"] is None
     assert "你好执行者" in loose[0]["text"]
+
+
+def test_timeline_paginated_without_n_plus_one(tmp_path: Path) -> None:
+    """timeline 游标分页：固定查询数、无逐 turn N+1；只带页内 turn 元数据。"""
+    from agent.core.events import TOOL_STARTED
+
+    store = SessionStore(tmp_path / "s.db")
+    store.create_session("s1", "default", "会话")
+    turns = [store.create_turn("s1", f"问题{i}", "completed") for i in range(30)]
+    for i, turn in enumerate(turns):
+        for j in range(5):
+            store.add_event("s1", TOOL_STARTED, float(i * 10 + j), turn_id=turn,
+                            actor="main", name=f"t{j}")
+    seen: list[str] = []
+    store._conn.set_trace_callback(seen.append)
+    with TestClient(create_app(make_orch(tmp_path, store=store))) as client:
+        data = client.get("/api/timeline",
+                          params={"session": "s1", "limit": 20}).json()
+        store._conn.set_trace_callback(None)  # 退出 lifespan 前先摘掉（随后 store 会被关闭）
+    idxs = [e["idx"] for e in data["events"]]
+    assert idxs == sorted(idxs) and len(idxs) == 20
+    assert data["has_more"] is True
+    assert data["before_idx"] == idxs[0]
+    assert len(data["turns"]) == 4  # 只返回页内事件涉及的 turn
+    assert data["turns"][-1]["id"] == turns[-1]
+    event_queries = [s for s in seen if "execution_events" in s]
+    assert len(event_queries) == 2  # 分页 + has_more；无逐 turn 全表扫描
+
+
+def test_executor_messages_paginated_and_live_shape(tmp_path: Path) -> None:
+    from agent.providers import Message
+
+    store = SessionStore(tmp_path / "s.db")
+    store.create_session("s1", "default", "会话")
+    store.append("s1", [Message(role="user", content=f"m{i}") for i in range(25)], "executor")
+    with TestClient(create_app(make_orch(tmp_path, store=store))) as client:
+        data = client.get("/api/executor_messages",
+                          params={"session": "s1", "limit": 10}).json()
+    assert [m["content"] for m in data["messages"]] == [f"m{i}" for i in range(15, 25)]
+    assert data["has_more"] is True
+    assert data["live"] is None and data["inflight"] == []
+    assert data["report"] is True

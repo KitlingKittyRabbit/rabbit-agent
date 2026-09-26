@@ -62,6 +62,8 @@ class ExecutorSession:
         self._tools = None
         self._working: list[Message] | None = None   # 进行中任务的工作集（含未持久化尾部）
         self._inflight_anchor: Message | None = None  # 当前任务消息对象（inflight 锚点）
+        # 实时快照：当前模型回合已流出、尚未形成完整消息的文本/思考（刷新/重连恢复用）
+        self._live: dict | None = None
 
     @property
     def messages(self) -> list[Message]:
@@ -110,6 +112,20 @@ class ExecutorSession:
             except Exception as e:
                 # 关机时 store 可能已关：中断保留尽力而为，绝不掩盖 CancelledError
                 logger.warning("中断保留落盘失败: %s", e)
+
+    def live_snapshot(self) -> dict | None:
+        """当前任务的实时快照（整任务累积：文本/工具分段 + 思考），无任务返回 None。
+
+        模型正在生成、尚未形成完整消息的文字也在其中：刷新/重连不依赖 inflight。
+        """
+        if self._live is None:
+            return None
+        return {
+            "task_id": self._live["task_id"],
+            "step": self._live["step"],
+            "reasoning": self._live["reasoning"],
+            "segments": [dict(seg) for seg in self._live["segments"]],
+        }
 
     def inflight_messages(self) -> list[Message]:
         """进行中任务的未持久化消息（从任务消息对象起；截断/压缩不影响）。
@@ -188,8 +204,19 @@ class ExecutorSession:
             record(TASK_DIFF, actor=ACTOR_SUBAGENT, task_id=task_id, turn_id=turn,
                    text=json.dumps(payload, ensure_ascii=False))
 
+        def live_text(text: str) -> None:
+            live = self._live
+            if live is None or not text:
+                return
+            segs = live["segments"]
+            if segs and segs[-1]["kind"] == "text":
+                segs[-1]["text"] += text
+            else:
+                segs.append({"kind": "text", "text": text})
+
         def on_text(text: str) -> None:
             partial_text.append(text)
+            live_text(text)
             record(SUBAGENT_TEXT_DELTA, actor=ACTOR_SUBAGENT, task_id=task_id,
                    turn_id=turn, text=text)
 
@@ -200,6 +227,10 @@ class ExecutorSession:
                 if change is not None:
                     accrue(task_diff, change)
             if phase == "started":
+                if self._live is not None:
+                    self._live["segments"].append(
+                        {"kind": "tool", "name": call.name,
+                         "arguments": _preview(str(call.arguments), 120)})
                 if store is not None:
                     # 最近动作属 actions 维度；步数（模型回合）由 on_step 单独维护
                     store.update_task(
@@ -210,6 +241,11 @@ class ExecutorSession:
                 record(SUBAGENT_TOOL_STARTED, actor=ACTOR_SUBAGENT, task_id=task_id,
                        turn_id=turn, name=call.name, arguments=_preview(str(call.arguments)))
             else:
+                if self._live is not None:
+                    self._live["segments"].append(
+                        {"kind": "result", "name": call.name,
+                         "status": _classify_status("finished", payload),
+                         "result": _preview(payload or "", 200)})
                 record(SUBAGENT_TOOL_FINISHED, actor=ACTOR_SUBAGENT, task_id=task_id,
                        turn_id=turn, name=call.name,
                        status=_classify_status("finished", payload),
@@ -217,6 +253,8 @@ class ExecutorSession:
 
         def on_reasoning(chunk: str) -> None:
             partial_reasoning.append(chunk)
+            if self._live is not None:
+                self._live["reasoning"] += chunk
             record(REASONING_DELTA, actor=ACTOR_SUBAGENT, task_id=task_id,
                    turn_id=turn, text=chunk)
 
@@ -224,6 +262,8 @@ class ExecutorSession:
             """步数 = 已完成的模型回合数；落库 + 广播，运行中与结束值同一口径。"""
             partial_text.clear()          # 上一轮的文本已进入 messages，避免重复补写
             partial_reasoning.clear()
+            if self._live is not None:    # 快照按整任务累积（工具前后连续），步进只更新计数
+                self._live["step"] = step
             if store is not None:
                 store.update_task(task_id, sid, TASK_RUNNING, steps_used=step)
             registry.emit({
@@ -244,6 +284,7 @@ class ExecutorSession:
         async def go() -> str:
             self._working = working                    # 在协程内登记，防未启动即泄漏
             self._inflight_anchor = task_msg           # 对象身份锚定：截断/压缩不影响
+            self._live = {"task_id": task_id, "step": 0, "reasoning": "", "segments": []}
             loop = AgentLoop(
                 registry.executor_provider,
                 tools,
@@ -260,6 +301,10 @@ class ExecutorSession:
                 self._persist_interrupted(
                     working, store, "".join(partial_text), "".join(partial_reasoning),
                 )
+                self._live = None
+                raise
+            except Exception:
+                self._live = None      # 失败任务不保留实时快照（部分输出已入事件日志）
                 raise
             finally:
                 record_diff()          # 成功/失败/中断都汇总已产生的文件改动
@@ -273,6 +318,7 @@ class ExecutorSession:
                                   steps_used=result.steps, stop_reason=result.stop_reason)
             self._working = None
             self._inflight_anchor = None
+            self._live = None          # 已持久化：实时快照退役
             if result.stop_reason == "completed":
                 return result.text
             raise TaskIncomplete(

@@ -219,59 +219,75 @@ def create_app(orchestrator, token: str = "") -> FastAPI:
         return JSONResponse({"skills": list_skills(root)})
 
     @app.get("/api/timeline")
-    async def api_timeline(session: str = Query(...), token: str = Query("")) -> JSONResponse:
-        """会话完整可视历史：turns（含各自执行事件）+ tasks + context 估算。"""
+    async def api_timeline(
+        session: str = Query(...), token: str = Query(""),
+        before_idx: int | None = Query(None), limit: int = Query(2000),
+    ) -> JSONResponse:
+        """会话可视历史（游标分页）：默认最后 limit 条事件 + 页内 turn 元数据 + tasks。"""
         if not _token_ok(token):
             return JSONResponse({"error": "未授权"}, status_code=401)
         store = orchestrator.store
         if store is None:
-            return JSONResponse({"turns": [], "tasks": [], "context": None})
-        turns = store.list_turns(session)
-        for turn in turns:
-            turn["events"] = store.list_events(session, turn_id=turn["id"])
-        tasks = store.list_tasks(session)
-        loose = [e for e in store.list_events(session) if e["turn_id"] is None]
+            return JSONResponse({"turns": [], "events": [], "tasks": [], "context": None})
+        page = store.list_events_page(session, before_idx=before_idx, limit=limit)
+        turn_ids = [e["turn_id"] for e in page["events"] if e["turn_id"] is not None]
+        turns = store.list_turns_by_ids(session, turn_ids)
+        # final_output 体积大且卡片不用：时间线不返回（详情走 /api/task）
+        tasks = [
+            {k: v for k, v in t.items() if k != "final_output"}
+            for t in store.list_tasks(session)
+        ]
         return JSONResponse(
-            {"turns": turns, "tasks": tasks, "loose_events": loose,
-             "context": _session_context(orchestrator, session)}
+            {"turns": turns, "events": page["events"], "tasks": tasks,
+             "context": _session_context(orchestrator, session),
+             "has_more": page["has_more"], "before_idx": page["before_idx"]}
         )
 
     @app.get("/api/executor_messages")
     async def api_executor_messages(
-        session: str = Query(...), token: str = Query("")
+        session: str = Query(...), token: str = Query(""),
+        before_idx: int | None = Query(None), limit: int = Query(200),
     ) -> JSONResponse:
-        """执行者会话完整历史（store 流 "executor" 的消息）。"""
+        """执行者历史（游标分页）+ 进行中消息 + 未完成段实时快照。"""
         if not _token_ok(token):
             return JSONResponse({"error": "未授权"}, status_code=401)
         store = orchestrator.store
         if store is None:
-            return JSONResponse({"messages": []})
-        msgs = store.load(session, "executor")
+            return JSONResponse({"messages": [], "inflight": [], "live": None})
+        page = store.load_page(session, "executor", before_idx=before_idx, limit=limit)
         conv = orchestrator.conversations.get(session)
         inflight = conv.executor_inflight() if conv is not None else []
-        return JSONResponse({"messages": [
-            {
-                "role": m.role,
-                "content": m.content,
-                "reasoning": m.reasoning,
-                "tool_calls": [
-                    {"name": tc.name, "arguments": tc.arguments}
-                    for tc in (m.tool_calls or [])
-                ],
-            }
-            for m in msgs
-        ], "inflight": [
-            {
-                "role": m.role,
-                "content": m.content,
-                "reasoning": m.reasoning,
-                "tool_calls": [
-                    {"name": tc.name, "arguments": tc.arguments}
-                    for tc in (m.tool_calls or [])
-                ],
-            }
-            for m in inflight
-        ], "report": conv.executor_report() if conv is not None else True})
+        live = conv.executor_live() if conv is not None else None
+        return JSONResponse({
+            "messages": [
+                {
+                    "idx": m["idx"],
+                    "role": m["role"],
+                    "content": m["content"],
+                    "reasoning": m["reasoning"],
+                    "tool_calls": [
+                        {"name": tc.name, "arguments": tc.arguments}
+                        for tc in (m["tool_calls"] or [])
+                    ],
+                }
+                for m in page["messages"]
+            ],
+            "has_more": page["has_more"], "before_idx": page["before_idx"],
+            "inflight": [
+                {
+                    "role": m.role,
+                    "content": m.content,
+                    "reasoning": m.reasoning,
+                    "tool_calls": [
+                        {"name": tc.name, "arguments": tc.arguments}
+                        for tc in (m.tool_calls or [])
+                    ],
+                }
+                for m in inflight
+            ],
+            "live": live,
+            "report": conv.executor_report() if conv is not None else True,
+        })
 
     @app.get("/api/task")
     async def api_task(

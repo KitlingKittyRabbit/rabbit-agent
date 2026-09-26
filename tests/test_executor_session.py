@@ -1002,3 +1002,55 @@ async def test_direct_chat_reported_when_switch_on(tmp_path: Path) -> None:
     assert "你对执行者说：你心情怎么样" in report
     assert "执行者输出：执行者回答" in report
     assert main.calls, "指挥者应被唤醒去处理这条回报"
+
+
+async def test_executor_live_snapshot_tracks_unfinished_segment(tmp_path: Path) -> None:
+    """实时快照：整任务累积（文本/工具/结果分段），流式中可查；任务结束退役。"""
+    (tmp_path / "a.txt").write_text("内容", encoding="utf-8")
+    store = SessionStore(tmp_path / "s.db")
+    snaps: list[dict | None] = []
+    ref: dict = {}
+    calls = {"n": 0}
+
+    class _Probe:
+        async def chat(self, messages, tools=None, on_text=None, on_reasoning=None,
+                       session_id=None):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                if on_reasoning:
+                    on_reasoning("思考中")
+                if on_text:
+                    on_text("第一段")
+                snaps.append(ref["conv"].executor_live())
+                return ChatResult(
+                    tool_calls=[ToolCall(id="t1", name="read_file",
+                                         arguments={"path": "a.txt"})],
+                    stop_reason="tool_use",
+                )
+            if on_text:
+                on_text("第二段")
+            snaps.append(ref["conv"].executor_live())  # 整任务累积：上一段仍在
+            return ChatResult(text="完成")
+
+    orch = make_orch(tmp_path, FakeProvider([ChatResult(text="x")]), _Probe(), store=store)
+    conv = orch.conversations[_sid(orch)]
+    ref["conv"] = conv
+    await orch.start()
+    try:
+        conv._dispatcher.dispatch("任务一")
+        await _wait(lambda: conv._dispatcher.tasks.get(1) == "done")
+    finally:
+        await orch.stop()
+
+    first, second = snaps
+    assert first and first["task_id"] == 1
+    assert first["reasoning"] == "思考中"
+    assert first["segments"] == [{"kind": "text", "text": "第一段"}]
+    # 工具调用前后连续：第一段仍在，且包含工具/结果分段
+    assert second["segments"][0] == {"kind": "text", "text": "第一段"}
+    assert {"kind": "text", "text": "第二段"} in second["segments"]
+    assert any(seg["kind"] == "tool" and seg["name"] == "read_file"
+               for seg in second["segments"])
+    assert any(seg["kind"] == "result" for seg in second["segments"])
+    assert second["step"] == 1
+    assert conv.executor_live() is None  # 任务结束退役

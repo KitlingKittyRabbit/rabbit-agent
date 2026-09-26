@@ -497,3 +497,18 @@ hr.sep { border: none; border-top: 1px solid var(--border); margin: 6px 0; }
 }
 .msg-user[data-turn]:hover .undo-btn { visibility: visible; opacity: 1; }
 .msg-user .undo-btn:hover { color: #fff; border-color: var(--danger); background: rgba(240, 115, 106, .18); }
+
+/* ---------- 分页与实时流式（性能修复） ---------- */
+.load-older {
+  display: block; margin: 10px auto; padding: 4px 14px;
+  font-size: 12px; color: var(--text-dim); background: transparent;
+  border: 1px solid var(--border); border-radius: 999px; cursor: pointer;
+}
+.load-older:hover { color: var(--text); border-color: var(--border-strong); }
+.load-older-hint { margin: 6px 0 2px; font-size: 12px; color: var(--text-dim); }
+.task-card .tc-preview {
+  color: var(--text-dim); font-size: 12px; margin-top: 2px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%;
+}
+.exec-live-text { white-space: pre-wrap; word-break: break-word; }
+.exec-msg-reasoning summary { cursor: pointer; }
