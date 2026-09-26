@@ -367,6 +367,27 @@ class ProviderManager:
         )
 
 
+    def _new_role_instance(
+        self, *, protocol: str, base_url: str | None, model: str, api_key: str,
+        capability: ModelCapability, effort: str,
+    ) -> Provider:
+        """按角色请求参数构建独立 provider 实例（凭据/注册共享，实例不共享）。"""
+        provider = self._provider_factory(
+            protocol=protocol, base_url=base_url, model=model, api_key=api_key,
+            context_window=capability.window,
+            reasoning_effort=(
+                effort if capability.reasoning_mode == "adjustable" else "off"
+            ),
+            echo_reasoning_field=capability.interleaved,
+        )
+        provider._reasoning_effort = (
+            effort if capability.reasoning_mode == "adjustable" else None
+        )
+        if hasattr(provider, "reasoning_reserve"):
+            provider._thinking_budget = provider.reasoning_reserve(effort)
+        return provider
+
+
     def _instance_for_listing(self, pid: str) -> Provider:
         """模型目录专用实例：固定 effort=off，绝不继承任一角色的思考强度。"""
         entry = self._providers.get(pid)
@@ -957,28 +978,19 @@ class ProviderManager:
 
         # 能力校验通过：用最终参数重建候选（factory 收到正确 effort），ping 验证后保存
         try:
-            candidate = self._provider_factory(
+            candidate = self._new_role_instance(
                 protocol=protocol, base_url=base_url, model=effective_model,
-                api_key=effective_key, context_window=capability.window,
-                reasoning_effort=(
-                    reasoning_effort if capability.reasoning_mode == "adjustable" else "off"
-                ),
-                echo_reasoning_field=capability.interleaved,
+                api_key=effective_key, capability=capability, effort=reasoning_effort,
             )
         except Exception as e:
             return {"type": "provider_result", "role": role, "ok": False,
                     "message": f"配置无效（未保存）: {e}"}
-        candidate._reasoning_effort = (
-            reasoning_effort if capability.reasoning_mode == "adjustable" else None
-        )
         if reasoning_effort != "off" and hasattr(candidate, "reasoning_reserve"):
             reserve = candidate.reasoning_reserve(reasoning_effort)
             if not isinstance(reserve, int) or reserve <= 0:
                 return {"type": "provider_result", "role": role, "ok": False,
                         "message": (f"该 provider 的协议不识别思考强度 {reasoning_effort}，"
                                     "请在模型能力设置中只声明其支持的档位")}
-        if hasattr(candidate, "reasoning_reserve"):
-            candidate._thinking_budget = candidate.reasoning_reserve(reasoning_effort)
         try:
             await candidate.chat([Message(role="user", content="ping")])
         except Exception as e:
@@ -987,12 +999,23 @@ class ProviderManager:
 
         unbound = [r for r in ("main", "executor") if not self._role_usable(r)]
         targets = [role] if role else unbound
-        for target in targets:
+        # 角色实例必须独立：首个目标复用已验证候选，其余各建独立实例（凭据共享）
+        try:
+            instances: list[Provider] = [candidate] if targets else []
+            for _ in targets[1:]:
+                instances.append(self._new_role_instance(
+                    protocol=protocol, base_url=base_url, model=effective_model,
+                    api_key=effective_key, capability=capability, effort=reasoning_effort,
+                ))
+        except Exception as e:
+            return {"type": "provider_result", "role": role, "ok": False,
+                    "message": f"配置无效（未保存）: {e}"}
+        for target, instance in zip(targets, instances, strict=True):
             self._roles[target] = {
                 "provider_id": pid, "model": effective_model,
                 "reasoning_effort": reasoning_effort,
             }
-            self._instances[(target, pid, effective_model)] = candidate
+            self._instances[(target, pid, effective_model)] = instance
         if not role:
             # 已绑定到该 provider 的角色：丢弃旧凭据实例，稍后用新凭据重建
             for r, binding in self._roles.items():
