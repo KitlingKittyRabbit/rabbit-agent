@@ -1257,3 +1257,67 @@ async def test_undo_legacy_message_errors_without_stopping_turn(tmp_path: Path) 
     finally:
         await orch.stop()
         store.close()
+
+
+# ---------- 流式片段合并（写入侧） ----------
+
+
+async def test_stream_deltas_coalesced_and_ordered(tmp_path: Path) -> None:
+    """数千小 delta：文本完整、持久化行数显著减少；工具事件边界不跨合并。"""
+    from agent.core.events import REASONING_DELTA, SUBAGENT_TOOL_STARTED
+    from agent.core.session import SessionStore
+
+    store = SessionStore(tmp_path / "s.db")
+    orch = make_orch(tmp_path, FakeProvider([ChatResult(text="x")]), FakeProvider([]),
+                     store=store)
+    conv = next(iter(orch.conversations.values()))
+    for i in range(3000):
+        conv._record_event(REASONING_DELTA, actor="main", text=f"{i % 10}")
+    conv._flush_delta()
+    events = store.list_events(conv.id)
+    assert len(events) <= 5
+    assert "".join(e["text"] for e in events) == "".join(f"{i % 10}" for i in range(3000))
+
+    conv._record_event(REASONING_DELTA, actor="subagent", task_id=1, turn_id=1, text="a")
+    conv._record_event(SUBAGENT_TOOL_STARTED, actor="subagent", task_id=1, turn_id=1,
+                       name="t", arguments="{}")
+    conv._record_event(REASONING_DELTA, actor="subagent", task_id=1, turn_id=1, text="b")
+    conv._flush_delta()
+    tail = [e for e in store.list_events(conv.id) if e["turn_id"] == 1]
+    assert [e["type"] for e in tail] == [REASONING_DELTA, SUBAGENT_TOOL_STARTED,
+                                         REASONING_DELTA]
+    assert [e["text"] for e in tail] == ["a", None, "b"]
+    store.close()
+
+
+async def test_stream_delta_flushed_by_timer(tmp_path: Path) -> None:
+    """片段到达后无需显式操作，定时窗口到点自动落库。"""
+    from agent.core.events import REASONING_DELTA
+    from agent.core.session import SessionStore
+
+    store = SessionStore(tmp_path / "s.db")
+    orch = make_orch(tmp_path, FakeProvider([ChatResult(text="x")]), FakeProvider([]),
+                     store=store)
+    conv = next(iter(orch.conversations.values()))
+    conv._record_event(REASONING_DELTA, actor="main", text="尾")
+    assert store.list_events(conv.id) == []  # 尚在缓冲
+    await asyncio.sleep(0.35)
+    assert [e["text"] for e in store.list_events(conv.id)] == ["尾"]
+    store.close()
+
+
+async def test_stream_delta_flushed_on_shutdown(tmp_path: Path) -> None:
+    """服务关闭/取消时冲刷尾部片段，不丢内容。"""
+    from agent.core.events import REASONING_DELTA
+    from agent.core.session import SessionStore
+
+    store = SessionStore(tmp_path / "s.db")
+    orch = make_orch(tmp_path, FakeProvider([ChatResult(text="x")]), FakeProvider([]),
+                     store=store)
+    await orch.start()
+    conv = next(iter(orch.conversations.values()))
+    conv._record_event(REASONING_DELTA, actor="main", text="尾巴")
+    await orch.stop()  # stop 会先 shutdown 会话（冲刷）再关库
+    reopened = SessionStore(tmp_path / "s.db")
+    assert [e["text"] for e in reopened.list_events(conv.id)] == ["尾巴"]
+    reopened.close()

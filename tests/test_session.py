@@ -3,6 +3,8 @@
 import sqlite3
 from pathlib import Path
 
+import pytest
+
 from agent.core.session import SessionStore
 from agent.providers import Message, ToolCall
 
@@ -318,3 +320,133 @@ def test_turn_undoable_states(tmp_path: Path) -> None:
         assert store.turn_undoable("s1", fresh) is True
     finally:
         store.close()
+
+
+# ---------- 事件碎片整理（旧库迁移）与游标分页 ----------
+
+
+def _seed_deltas(store: SessionStore, session: str = "s1") -> None:
+    from agent.core.events import REASONING_DELTA, SUBAGENT_TOOL_STARTED
+
+    for i in range(50):
+        store.add_event(session, REASONING_DELTA, 1.0 + i, turn_id=1, task_id=1,
+                        actor="subagent", text=f"{i % 10}")
+    store.add_event(session, SUBAGENT_TOOL_STARTED, 2.0, turn_id=1, task_id=1,
+                    actor="subagent", name="t", arguments="{}")
+    for i in range(50):
+        store.add_event(session, REASONING_DELTA, 3.0 + i, turn_id=1, task_id=1,
+                        actor="subagent", text="x")
+    store.add_event(session, SUBAGENT_TOOL_STARTED, 4.0, turn_id=2, task_id=1,
+                    actor="subagent", name="t2", arguments="{}")
+
+
+def test_compact_events_merges_with_backup_and_digest(tmp_path: Path) -> None:
+    """旧库碎片整理：事务合并、文本/顺序一致、生成备份、写 user_version。"""
+    db = tmp_path / "s.db"
+    store = SessionStore(db)
+    _seed_deltas(store)
+    store._conn.execute("PRAGMA user_version = 0")  # 模拟旧库（打开时已标记）
+    store._conn.commit()
+    digest_before = store._logical_digest()
+
+    report = store.compact_events()
+
+    assert report is not None and report["removed"] > 0
+    assert report["after"] < report["before"]
+    assert Path(report["backup"]).is_file()
+    assert store._conn.execute("PRAGMA user_version").fetchone()[0] == 1
+    assert store._logical_digest() == digest_before  # 文本拼接与事件顺序一致
+    events = store.list_events("s1")
+    merged = [e for e in events if e["type"] == "reasoning_delta"]
+    assert [e["text"] for e in merged] == [
+        "".join(str(i % 10) for i in range(50)), "x" * 50,
+    ]
+    store.close()
+
+
+def test_compact_events_idempotent(tmp_path: Path) -> None:
+    db = tmp_path / "s.db"
+    store = SessionStore(db)
+    _seed_deltas(store)
+    store._conn.execute("PRAGMA user_version = 0")
+    store._conn.commit()
+    first = store.compact_events()
+    assert first and first["removed"] > 0
+    count = store._count_events()
+    assert store.compact_events() is None  # 已标记：跳过
+    store._conn.execute("PRAGMA user_version = 0")
+    store._conn.commit()
+    again = store.compact_events()
+    assert again is None or again["removed"] == 0
+    assert store._count_events() == count  # 再跑不改数据
+    store.close()
+
+
+def test_compact_events_rolls_back_on_digest_mismatch(tmp_path: Path, monkeypatch) -> None:
+    db = tmp_path / "s.db"
+    store = SessionStore(db)
+    _seed_deltas(store)
+    store._conn.execute("PRAGMA user_version = 0")
+    store._conn.commit()
+    real = store._logical_digest
+    calls = {"n": 0}
+
+    def fake():
+        calls["n"] += 1
+        return real() if calls["n"] == 1 else "mismatch"
+
+    monkeypatch.setattr(store, "_logical_digest", fake)
+    with pytest.raises(RuntimeError, match="校验失败"):
+        store.compact_events()
+    assert store._conn.execute("PRAGMA user_version").fetchone()[0] == 0
+    assert store._count_events() == 102  # 回滚：行数与碎片原样保留
+    store.close()
+
+
+def test_events_page_cursor_roundtrip(tmp_path: Path) -> None:
+    from agent.core.events import TOOL_STARTED
+
+    store = SessionStore(tmp_path / "s.db")
+    for i in range(25):
+        store.add_event("s1", TOOL_STARTED, float(i), turn_id=1, actor="main", name=f"t{i}")
+    page1 = store.list_events_page("s1", limit=10)
+    assert [e["idx"] for e in page1["events"]] == list(range(16, 26))
+    assert page1["has_more"] is True
+    page2 = store.list_events_page("s1", before_idx=page1["before_idx"], limit=10)
+    assert [e["idx"] for e in page2["events"]] == list(range(6, 16))
+    page3 = store.list_events_page("s1", before_idx=page2["before_idx"], limit=10)
+    assert [e["idx"] for e in page3["events"]] == list(range(1, 6))
+    assert page3["has_more"] is False
+    union = [e["idx"] for e in page1["events"] + page2["events"] + page3["events"]]
+    assert sorted(union) == list(range(1, 26))  # 无重无漏
+    store.close()
+
+
+def test_indexes_exist_and_are_used(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path / "s.db")
+    names = {r[0] for r in store._conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='execution_events'")}
+    assert {"idx_events_session_turn", "idx_events_session_idx",
+            "idx_events_session_task"} <= names
+    plan_turn = " ".join(str(r) for r in store._conn.execute(
+        "EXPLAIN QUERY PLAN SELECT idx FROM execution_events"
+        " WHERE session_id = ? AND turn_id = ? ORDER BY idx", ("s1", 1)))
+    assert "idx_events_session_turn" in plan_turn
+    plan_page = " ".join(str(r) for r in store._conn.execute(
+        "EXPLAIN QUERY PLAN SELECT idx FROM execution_events"
+        " WHERE session_id = ? AND idx < 100 ORDER BY idx DESC LIMIT 5", ("s1",)))
+    assert "idx_events_session_idx" in plan_page
+    store.close()
+
+
+def test_load_page_cursor(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path / "s.db")
+    store.append("s1", [Message(role="user", content=f"m{i}") for i in range(25)], "executor")
+    page = store.load_page("s1", "executor", limit=10)
+    assert [m["content"] for m in page["messages"]] == [f"m{i}" for i in range(15, 25)]
+    assert page["has_more"] is True
+    older = store.load_page("s1", "executor", before_idx=page["before_idx"], limit=10)
+    assert [m["content"] for m in older["messages"]] == [f"m{i}" for i in range(5, 15)]
+    assert [m["idx"] for m in page["messages"]] == list(range(16, 26))
+    assert [m["idx"] for m in older["messages"]] == list(range(6, 16))
+    store.close()

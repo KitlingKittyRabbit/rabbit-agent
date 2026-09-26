@@ -18,14 +18,17 @@ import {
   finalPreview,
   filterModels,
   groupActivityEvents,
+  groupEventsByTurn,
   hasWork,
   inspectorLines,
   extractMath,
   insertMention,
   isSystemTurn,
-  liveBufferStale,
   mentionQuery,
+  mergeEventPage,
+  mergeLiveState,
   mergeTask,
+  terminalEventLoaded,
   modelMenuState,
   modelSelectAction,
   pairToolEvents,
@@ -45,6 +48,7 @@ import {
   shortArg,
   taskCardAction,
   taskCardLines,
+  taskCardPreview,
   taskStatusText,
   turnSummaryText,
 } from "./timeline_logic.mjs?v=2";
@@ -57,6 +61,10 @@ const state = {
   providerStatus: null, liveTaskProgress: {}, turnsById: {},
   taskCards: {}, taskCardEls: {}, fsPath: ".",
   modelCatalog: null, execLive: {},
+  // 时间线分页存储：事件按 idx 去重，turn 元数据按 id；历史节点按 turn 记锚点
+  timeline: {events: {}, turns: {}, hasMore: false, beforeIdx: null, loading: false},
+  timelineAnchors: {}, liveNodes: null, loadOlderBtn: null,
+  execDirty: new Set(), execRaf: null,
 };
 
 /* ---------- 基础设施 ---------- */
@@ -226,13 +234,16 @@ function handle(ev) {
   if (t === "stopped") { setStatus(""); setBusy(false); note("[已中断]"); return; }
   if (t === "turn_end") { setStatus(""); setBusy(false); return; }
 
-  // 执行事件 → 时间线
-  const execDelta = t === "subagent_text_delta"
-    || (t === "reasoning_delta" && ev.actor === "subagent");
-  if (EXEC_EVENT_TYPES.has(t) && (t !== "reasoning_delta" || ev.actor === "subagent")
-      && !execDelta) {
-    clearExecLive(ev.task_id);      // 该轮已入 messages/inflight，实时缓冲退役
-    maybeRefreshExecutor(ev.session);
+  // 执行事件 → 分页存储（供上滚重渲染按 idx 去重；刷新/重连恢复一致）
+  if (ev.session === state.current && ev.idx !== undefined) {
+    mergeEventPage(state.timeline.events, [ev]);
+  }
+  if (t === "subagent_queued" || t === "subagent_started" || t === "subagent_completed"
+      || t === "subagent_failed") {
+    updateExecButton();  // 任务生命周期：停止/发送按钮状态跟随
+  }
+  if (t === "subagent_completed" || t === "subagent_failed") {
+    maybeRefreshExecutor(ev.session);  // 任务终态：刷新历史并让 live 退役
   }
   routeExecution(ev);
 }
@@ -266,7 +277,7 @@ function renderUsageLine() {
 }
 
 /* ---------- Turn 结构构建 ---------- */
-function userBubble(text, turnId) {
+function userBubble(text, turnId, insertBefore = null) {
   const el = document.createElement("div"); el.className = "msg-user";
   const bubble = document.createElement("div"); bubble.className = "mu-bubble";
   const body = document.createElement("div"); body.className = "mu-text"; body.textContent = text;
@@ -287,7 +298,10 @@ function userBubble(text, turnId) {
     el.classList.add("pending-turn");
     el.dataset.pendingText = text;
   }
-  stream().appendChild(el); scrollDown();
+  if (insertBefore) stream().insertBefore(el, insertBefore);
+  else stream().appendChild(el);
+  if (!insertBefore) scrollDown();
+  return el;
 }
 
 function pendingBubbles() {
@@ -525,12 +539,15 @@ function ensureTaskCard(taskId, title, status, container) {
     actions: prog.actions,
     last_action: prog.last || task.last_action || "",
     stop_reason: task.stop_reason || "",
+    preview: prog.lastOutput || "",
   });
   card = document.createElement("div");
   card.className = "task-card"; card.dataset.task = taskId; card.dataset.status = status;
-  card.innerHTML = `<div class="tc-title"></div><div class="tc-progress"></div>`;
+  card.innerHTML = `<div class="tc-title"></div><div class="tc-progress"></div>`
+    + `<div class="tc-preview"></div>`;
   card.querySelector(".tc-title").textContent = lines.title;
   card.querySelector(".tc-progress").textContent = lines.line;
+  card.querySelector(".tc-preview").textContent = lines.preview;
   card.onclick = () => openExecutorTab();
   container.appendChild(card); state.taskCardEls[taskId] = card; scrollDown();
   return card;
@@ -549,11 +566,27 @@ function paintTaskCard(taskId) {
     actions: prog.actions,
     last_action: prog.last || task.last_action || "",
     stop_reason: task.stop_reason || "",
+    preview: prog.lastOutput || "",
   });
   document.querySelectorAll(`.task-card[data-task="${taskId}"]`).forEach((el) => {
     el.dataset.status = status;
     const progressEl = el.querySelector(".tc-progress");
     if (progressEl) progressEl.textContent = lines.line;
+    const previewEl = el.querySelector(".tc-preview");
+    if (previewEl) previewEl.textContent = lines.preview;
+  });
+}
+
+const _cardPaintQueue = new Set();
+let _cardPaintRaf = null;
+function paintTaskCardThrottled(taskId) {
+  _cardPaintQueue.add(taskId);
+  if (_cardPaintRaf) return;
+  _cardPaintRaf = requestAnimationFrame(() => {
+    _cardPaintRaf = null;
+    const ids = [..._cardPaintQueue];
+    _cardPaintQueue.clear();
+    for (const id of ids) paintTaskCard(id);
   });
 }
 
@@ -569,7 +602,12 @@ function updateTaskCard(taskId, status, output) {
 function routeExecution(ev) {
   const t = ev.type;
   if (t === "subagent_text_delta") {
-    execAppendLive(ev.task_id, "text", ev.text || "");
+    execAppendLiveText(ev.task_id, ev.text || "");
+    if (ev.task_id != null) {
+      const prog = taskProgress(ev.task_id);
+      prog.lastOutput = taskCardPreview((prog.lastOutput || "") + (ev.text || ""));
+      paintTaskCardThrottled(ev.task_id);
+    }
     return;
   }
   if (t === "task_diff") {
@@ -605,7 +643,7 @@ function routeExecution(ev) {
       if (lt) appendReasoning(lt, ev.text || "");
     } else if (ev.task_id !== undefined && ev.task_id !== null) {
       appendTaskReasoning(ev.task_id, ev.text || "");
-      execAppendLive(ev.task_id, "reasoning", ev.text || "");
+      execAppendLiveReasoning(ev.task_id, ev.text || "");
     }
     return;
   }
@@ -630,8 +668,9 @@ function routeExecution(ev) {
     upsertTask(ev.task_id, {title: action.title, status: action.status}); return;
   }
   if (t === "subagent_tool_started") {
+    execAppendLiveTool(ev.task_id, ev.name, ev.arguments);
     const prog = state.liveTaskProgress[ev.task_id] ||
-      (state.liveTaskProgress[ev.task_id] = {steps: 0, actions: 0, last: ""});
+      (state.liveTaskProgress[ev.task_id] = {steps: 0, actions: 0, last: "", lastOutput: ""});
     prog.actions++;
     if (lt) {
       ensureTaskCard(ev.task_id, "", "running", ensureShell(lt).body);
@@ -660,7 +699,10 @@ function routeExecution(ev) {
     paintTaskCard(ev.task_id);
     return;
   }
-  if (t === "subagent_tool_finished") return;  // 不计二次动作，避免重复累计
+  if (t === "subagent_tool_finished") {
+    execAppendLiveResult(ev.task_id, ev.name, ev.status, ev.result);
+    return;  // 不计二次动作，避免重复累计
+  }
   if (t === "subagent_started") {
     const action = taskCardAction(ev);
     upsertTask(ev.task_id, {status: action.status});
@@ -730,32 +772,192 @@ function finishLiveTurn(turnId, outcome) {
     setStatus("");
     setBusy(false);
   }
+  // 该 turn 的 DOM 转为历史锚点：之后上滚重渲染按历史处理（事件已并入分页存储）
+  delete state.turnsById[turnId];
+  if (state.liveNodes && state.liveNodes.turnEl === lt.turn) {
+    state.timelineAnchors[turnId] = [state.liveNodes.bubble, state.liveNodes.turnEl]
+      .filter(Boolean);
+    state.liveNodes = null;
+  }
   scrollDown();
 }
 
 /* ---------- 历史时间线加载与渲染 ---------- */
 async function loadTimeline() {
   stream().innerHTML = "";
+  state.timelineAnchors = {}; state.liveNodes = null; state.loadOlderBtn = null;
+  state.turnsById = {}; state.liveTaskProgress = {};
   if (!state.current) return;
   const sid = state.current;
+  state.timeline = {events: {}, turns: {}, hasMore: false, beforeIdx: null, loading: false};
   const data = await api(`/api/timeline?session=${sid}`);
   if (state.current !== sid) return;  // 快速切换时丢弃过期响应
-  state.tasks = Object.fromEntries((data.tasks || []).map(t => [t.id, t]));
-  state.context = data.context;
-  renderRing(data.context);
-  setBusy((data.turns || []).some((t) => t.status === "running"));
-  for (const turn of data.turns || []) renderHistoryTurn(turn);
-  for (const e of data.loose_events || []) {
-    if (e.type === "user_to_executor") note(`你对执行者说：${e.text || ""}`);
-  }
+  applyTimelinePage(data);
+  renderHistoryAll();
   scrollDown();
   updateExecButton();
 }
 
-function renderHistoryTurn(turn) {
-  if (turn.user_message) userBubble(turn.user_message, turn.id);
+function applyTimelinePage(data) {
+  state.tasks = Object.fromEntries((data.tasks || []).map(t => [t.id, t]));
+  state.context = data.context;
+  renderRing(data.context);
+  setBusy((data.turns || []).some((t) => t.status === "running"));
+  mergeEventPage(state.timeline.events, data.events || []);
+  for (const t of data.turns || []) state.timeline.turns[t.id] = t;
+  state.timeline.hasMore = Boolean(data.has_more);
+  state.timeline.beforeIdx = data.before_idx ?? null;
+}
+
+async function loadOlderTimeline() {
+  if (!state.current || state.timeline.loading || !state.timeline.hasMore) return;
+  const sid = state.current;
+  const streamEl = stream();
+  const stick = shouldStickToBottom(streamEl.scrollHeight, streamEl.scrollTop,
+                                    streamEl.clientHeight);
+  state.timeline.loading = true;
+  try {
+    const data = await api(
+      `/api/timeline?session=${sid}&before_idx=${state.timeline.beforeIdx}`);
+    if (state.current !== sid) return;
+    applyTimelinePage(data);
+    renderHistoryAll();   // 按 idx 去重重建历史：分页边界 turn 合并后不重复不半截
+    if (stick) scrollDown();
+  } finally {
+    state.timeline.loading = false;
+  }
+}
+
+function renderHistoryAll() {
+  const streamEl = stream();
+  if (state.loadOlderBtn) { state.loadOlderBtn.remove(); state.loadOlderBtn = null; }
+  for (const nodes of Object.values(state.timelineAnchors)) nodes.forEach((n) => n.remove());
+  state.timelineAnchors = {};
+  const insertAt = state.liveNodes ? state.liveNodes.bubble : null;
+  if (state.timeline.hasMore) {
+    const btn = document.createElement("button");
+    btn.className = "load-older";
+    btn.textContent = "载入更早的记录";
+    btn.onclick = loadOlderTimeline;
+    streamEl.insertBefore(btn, insertAt);
+    state.loadOlderBtn = btn;
+  }
+  const groups = groupEventsByTurn(Object.values(state.timeline.events))
+    .filter((g) => g.turnId === "loose" || !state.turnsById[g.turnId]);
+  let firstTurn = true;
+  for (const g of groups) {
+    if (g.turnId === "loose") { renderLooseEvents(g.events, insertAt); continue; }
+    const meta = state.timeline.turns[g.turnId] || {id: g.turnId, status: "completed"};
+    const partial = firstTurn && state.timeline.hasMore && !terminalEventLoaded(g.events);
+    state.timelineAnchors[g.turnId] = renderHistoryTurn(
+      {...meta, events: g.events}, insertAt, partial);
+    firstTurn = false;
+  }
+}
+
+function renderLooseEvents(events, insertAt) {
+  for (const e of events || []) {
+    if (e.type !== "user_to_executor") continue;
+    const hint = document.createElement("div");
+    hint.className = "msg-note";
+    hint.textContent = `你对执行者说：${e.text || ""}`;
+    stream().insertBefore(hint, insertAt);
+  }
+}
+
+function taskProgress(taskId) {
+  return state.liveTaskProgress[taskId] ||
+    (state.liveTaskProgress[taskId] = {steps: 0, actions: 0, last: "", lastOutput: ""});
+}
+
+function registerLiveTurn(turn, turnEl, bubble, events) {
+  const shell = makeTurnShell(turnEl);
+  const lt = {
+    turnId: turn.id, turn: turnEl, shell, startedAt: Date.now(),
+    actions: 0, subagents: 0, finalEl: null, finalText: "", tasks: {},
+  };
+  state.turnsById[turn.id] = lt;
+  state.liveTurn = lt;
+  state.liveNodes = {bubble, turnEl};
+  setBusy(true); setStatus("Working…");
+  for (const e of events) replayLiveEvent(lt, e);
+  paintTurnSummary(lt);
+}
+
+function replayLiveEvent(lt, e) {
+  const prog = e.task_id != null ? taskProgress(e.task_id) : null;
+  if (e.type === "activity_text_delta") { addWorkingText(lt.shell.body, e.text); return; }
+  if (e.type === "tool_started") {
+    const row = addToolRow(lt.shell.body, e.name, e.arguments);
+    row.querySelector(".t-icon").textContent = "✓";
+    row.classList.add("done");
+    routeActionEvent(state.turnsById, e);
+    paintTurnSummary(lt);
+    return;
+  }
+  if (e.type === "subagent_text_delta") {
+    if (prog) prog.lastOutput = taskCardPreview((prog.lastOutput || "") + (e.text || ""));
+    return;
+  }
+  if (e.type === "subagent_tool_started") {
+    if (prog) prog.actions += 1;
+    ensureTaskCard(e.task_id, "", "running", lt.shell.body);
+    routeActionEvent(state.turnsById, e);
+    if (prog) prog.last = `${displayToolName(e.name)} ${compactArgs(e.name, e.arguments)}`.trim();
+    upsertTask(e.task_id, {last_action: prog ? prog.last : ""});
+    paintTaskCard(e.task_id);
+    return;
+  }
+  if (e.type === "subagent_step") {
+    if (prog) prog.steps = e.steps_used;
+    ensureTaskCard(e.task_id, "", "running", lt.shell.body);
+    upsertTask(e.task_id, {steps_used: e.steps_used, max_steps: e.max_steps});
+    paintTaskCard(e.task_id);
+    return;
+  }
+  if (e.type === "subagent_queued" || e.type === "subagent_started"
+      || e.type === "subagent_completed" || e.type === "subagent_failed") {
+    const action = taskCardAction(e);
+    ensureTaskCard(e.task_id, e.text || (state.tasks[e.task_id] || {}).title || "",
+                   action.status, lt.shell.body);
+    upsertTask(e.task_id, {status: action.status});
+    if (action.output) updateTaskCard(e.task_id, action.status, action.output);
+    markTurnTask(lt, e.task_id, action.status);
+    return;
+  }
+  if (e.type === "reasoning_delta") {
+    if (reasoningTarget(e) === "main") appendReasoning(lt, e.text || "");
+    else if (e.task_id != null) appendTaskReasoning(e.task_id, e.text || "");
+    return;
+  }
+  if (e.type === "final_started") {
+    const finalEl = document.createElement("div"); finalEl.className = "final";
+    finalEl.innerHTML = `<div class="final-label">Agent</div><div class="final-text"></div>`;
+    lt.turn.appendChild(finalEl);
+    lt.finalEl = finalEl;
+    return;
+  }
+  if (e.type === "final_text_delta" && lt.finalEl) {
+    lt.finalText += e.text || "";
+    lt.finalEl.querySelector(".final-text").textContent = lt.finalText;
+  }
+}
+
+function renderHistoryTurn(turn, insertBefore = null, partial = false) {
+  const nodes = [];
+  const bubble = turn.user_message
+    ? userBubble(turn.user_message, turn.id, insertBefore) : null;
+  if (bubble) nodes.push(bubble);
+  const turnEl = document.createElement("div");
+  turnEl.className = "turn";
+  stream().insertBefore(turnEl, insertBefore);
+  nodes.push(turnEl);
   const events = turn.events || [];
-  const turnEl = makeTurn();
+  if (turn.status === "running") {
+    // 打开会话时任务还在跑：登记为 live turn，后续 WS 增量继续追加
+    registerLiveTurn(turn, turnEl, bubble, events);
+    return nodes;
+  }
   if (hasWork(events)) {
     const shell = makeTurnShell(turnEl);
     shell.working.classList.remove("open");
@@ -826,13 +1028,20 @@ function renderHistoryTurn(turn) {
   for (const [taskId, chunks] of Object.entries(reasoningByTask)) {
     appendTaskReasoning(Number(taskId), chunks.join(""));
   }
-  if (turn.final_text) {
+  if (partial) {
+    // 分页边界落在 turn 中间：明示更早内容未载入，且不渲染最终回答（避免半截状态）
+    const marker = document.createElement("div");
+    marker.className = "load-older-hint";
+    marker.textContent = "…（更早内容未载入）";
+    turnEl.appendChild(marker);
+  } else if (turn.final_text) {
     const finalEl = document.createElement("div"); finalEl.className = "final";
     finalEl.innerHTML = `<div class="final-label">Agent</div><div class="final-text"></div>`;
     renderFinalText(finalEl.querySelector(".final-text"), turn.final_text);
     turnEl.appendChild(finalEl);
   }
   renderDiffCard(turnEl, diffSummary(events));
+  return nodes;
 }
 
 /* ---------- Task inspector ---------- */
@@ -943,6 +1152,8 @@ function selectSession(sid) {
   state.current = sid; state.activity.delete(sid); state.liveTurn = null;
   state.tasks = {}; state.liveTaskProgress = {}; state.turnsById = {};
   state.taskCards = {}; state.taskCardEls = {}; state.execLive = {};
+  state.execDirty = new Set();
+  state.execPage = {beforeIdx: null, hasMore: false, loading: false};
   setBusy(false);
   stream().innerHTML = ""; state.usage = null; state.context = null;
   $("ctx-badge").classList.add("hidden");
@@ -2011,26 +2222,63 @@ function renderExecutorHeader() {
   }
 }
 
-async function refreshExecutor() {
+let execRefreshTimer = null;
+state.execPage = {beforeIdx: null, hasMore: false, loading: false};
+
+async function refreshExecutor(beforeIdx = null) {
   if (!state.current) return;
   if (execRefreshing) { execPending = true; return; }
   execRefreshing = true;
   const sid = state.current;
   try {
-    const data = await api(`/api/executor_messages?session=${encodeURIComponent(sid)}`);
+    const query = beforeIdx == null ? "" : `&before_idx=${beforeIdx}`;
+    const data = await api(
+      `/api/executor_messages?session=${encodeURIComponent(sid)}${query}`);
     if (state.current !== sid) return;   // 快速切换：丢弃过期响应
     renderExecReport(data.report !== false);
-    renderExecutorMessages(data.messages || [], data.inflight || []);
+    if (beforeIdx == null) {
+      state.execPage = {beforeIdx: data.before_idx ?? null,
+                        hasMore: Boolean(data.has_more), loading: false};
+      applyServerLive(data.live || null);   // 恢复"当前未完成段"（不只依赖 inflight）
+      renderExecutorMessages(data.messages || [], data.inflight || []);
+    } else {
+      state.execPage.beforeIdx = data.before_idx ?? null;
+      state.execPage.hasMore = Boolean(data.has_more);
+      prependExecutorMessages(data.messages || []);
+    }
   } finally {
     execRefreshing = false;
     if (execPending) { execPending = false; refreshExecutor(); }  // 尾调用补偿
   }
 }
 
-function maybeRefreshExecutor(session) {
-  if (session === state.current && !$("tab-executor").classList.contains("hidden")) {
-    refreshExecutor();
+function applyServerLive(live) {
+  // 服务端实时快照权威：同步数取更长前缀；步进/无运行任务则本地缓冲退役
+  if (!live) {
+    for (const tid of Object.keys(state.execLive)) retireExecLive(tid);
+    return;
   }
+  const local = state.execLive[live.task_id] || null;
+  const merged = mergeLiveState(local, live);
+  for (const tid of Object.keys(state.execLive)) {
+    if (Number(tid) !== Number(live.task_id)) retireExecLive(tid);
+  }
+  if (merged) state.execLive[live.task_id] = merged;
+}
+
+function retireExecLive(taskId) {
+  delete state.execLive[taskId];
+  const el = document.getElementById(`exec-live-${taskId}`);
+  if (el) el.remove();
+}
+
+function maybeRefreshExecutor(session) {
+  if (session !== state.current || $("tab-executor").classList.contains("hidden")) return;
+  if (execRefreshTimer) return;   // 200ms 合并窗口：工具/步进连发只刷新一次
+  execRefreshTimer = setTimeout(() => {
+    execRefreshTimer = null;
+    refreshExecutor();
+  }, 200);
 }
 
 function renderExecutorMessages(messages, inflight) {
@@ -2038,6 +2286,13 @@ function renderExecutorMessages(messages, inflight) {
   const stick = shouldStickToBottom(box.scrollHeight, box.scrollTop, box.clientHeight);
   const prevTop = box.scrollTop;
   box.innerHTML = "";
+  if (state.execPage.hasMore) {
+    const btn = document.createElement("button");
+    btn.className = "load-older";
+    btn.textContent = "载入更早的执行记录";
+    btn.onclick = loadOlderExecutorMessages;
+    box.appendChild(btn);
+  }
   if (!messages.length && !(inflight && inflight.length)) {
     const empty = document.createElement("div");
     empty.className = "exec-empty";
@@ -2046,120 +2301,216 @@ function renderExecutorMessages(messages, inflight) {
     updateExecButton();
     return;
   }
-  for (const raw of messages) {
-    const m = executorMessageView(raw);
-    if (m.isToolResult) {
-      const el = document.createElement("div");
-      el.className = "exec-msg-result";
-      el.textContent = `↳ 工具结果：${m.text.slice(0, 300)}`;
-      box.appendChild(el);
-      continue;
-    }
-    if (m.role === "user") {
-      const el = document.createElement("div");
-      el.className = "exec-msg-user";
-      el.textContent = m.text;
-      renderMath(el);
-      box.appendChild(el);
-      continue;
-    }
-    if (m.role !== "assistant") continue;
-    const el = document.createElement("div");
-    el.className = "exec-msg-assistant";
-    if (m.reasoning) {
-      const details = document.createElement("details");
-      details.className = "exec-msg-reasoning";
-      const sum = document.createElement("summary");
-      sum.textContent = "思考";
-      const pre = document.createElement("pre");
-      pre.textContent = m.reasoning;
-      details.append(sum, pre);
-      el.appendChild(details);
-    }
-    if (m.text) {
-      const text = document.createElement("div");
-      text.textContent = m.text;
-      el.appendChild(text);
-    }
-    for (const call of m.calls) {
-      const row = document.createElement("div");
-      row.className = "exec-msg-tool";
-      row.textContent = `▸ ${call.name} ${JSON.stringify(call.arguments).slice(0, 120)}`;
-      el.appendChild(row);
-    }
-    renderMath(el);
-    box.appendChild(el);
-  }
-  renderExecutorInflight(inflight);
-  renderExecLiveBuffers(inflight);
+  for (const raw of messages) box.appendChild(executorMessageNode(raw));
+  // 有实时快照时由 live 覆盖整个运行中任务（含工具/结果分段），不再叠加 inflight
+  if (!Object.keys(state.execLive).length) renderExecutorInflight(inflight);
+  renderExecLiveBuffers();
   if (stick) box.scrollTop = box.scrollHeight;
   else box.scrollTop = prevTop;
   updateExecButton();
 }
 
-function renderExecLiveBuffers(inflight) {
-  const box = $("exec-timeline");
-  const assistants = (inflight || [])
-    .map((raw) => executorMessageView(raw))
-    .filter((m) => m.role === "assistant").length;
-  for (const [tid, buf] of Object.entries(state.execLive)) {
-    if (!buf.text && !buf.reasoning) continue;
-    const steps = state.liveTaskProgress[tid]?.steps;
-    // 步数基线未知（如切会话后回包未到）时不退役：等事件驱动的清理，避免误清前缀
-    if (steps !== undefined && liveBufferStale(steps, assistants)) {
-      delete state.execLive[tid];   // 本轮已进入 inflight 快照：实时缓冲退役
-      continue;
-    }
+function executorMessageNode(raw) {
+  const m = executorMessageView(raw);
+  if (m.isToolResult) {
     const el = document.createElement("div");
-    el.id = `exec-live-${tid}`;
-    el.className = "exec-msg-assistant inflight live";
-    renderExecLive(el, buf);
-    box.appendChild(el);
+    el.className = "exec-msg-result";
+    el.textContent = `↳ 工具结果：${m.text.slice(0, 300)}`;
+    return el;
   }
-}
-
-function renderExecLive(el, buf) {
-  el.textContent = "";
-  if (buf.reasoning) {
+  if (m.role === "user") {
+    const el = document.createElement("div");
+    el.className = "exec-msg-user";
+    el.textContent = m.text;
+    renderMath(el);
+    return el;
+  }
+  const el = document.createElement("div");
+  el.className = "exec-msg-assistant";
+  if (m.role !== "assistant") return el;
+  if (m.reasoning) {
     const details = document.createElement("details");
     details.className = "exec-msg-reasoning";
     const sum = document.createElement("summary");
     sum.textContent = "思考";
     const pre = document.createElement("pre");
-    pre.textContent = buf.reasoning;
+    pre.textContent = m.reasoning;
     details.append(sum, pre);
     el.appendChild(details);
   }
-  const text = document.createElement("div");
-  text.className = "exec-live-text";
-  text.textContent = buf.text;
-  el.appendChild(text);
-}
-
-function execAppendLive(taskId, kind, text) {
-  if (taskId === undefined || taskId === null || !text) return;
-  const buf = state.execLive[taskId]
-    || (state.execLive[taskId] = {text: "", reasoning: ""});
-  buf[kind] += text;
-  if ($("tab-executor").classList.contains("hidden")) return;
-  const box = $("exec-timeline");
-  const stick = shouldStickToBottom(box.scrollHeight, box.scrollTop, box.clientHeight);
-  let el = document.getElementById(`exec-live-${taskId}`);
-  if (!el) {
-    el = document.createElement("div");
-    el.id = `exec-live-${taskId}`;
-    el.className = "exec-msg-assistant inflight live";
-    box.appendChild(el);
+  if (m.text) {
+    const text = document.createElement("div");
+    text.textContent = m.text;
+    el.appendChild(text);
   }
-  renderExecLive(el, buf);
-  if (stick) box.scrollTop = box.scrollHeight;
+  for (const call of m.calls) {
+    const row = document.createElement("div");
+    row.className = "exec-msg-tool";
+    row.textContent = `▸ ${call.name} ${JSON.stringify(call.arguments).slice(0, 120)}`;
+    el.appendChild(row);
+  }
+  renderMath(el);
+  return el;
 }
 
-function clearExecLive(taskId) {
+async function loadOlderExecutorMessages() {
+  if (state.execPage.loading || !state.execPage.hasMore || !state.execPage.beforeIdx) return;
+  state.execPage.loading = true;
+  try {
+    await refreshExecutor(state.execPage.beforeIdx);
+  } finally {
+    state.execPage.loading = false;
+  }
+}
+
+function prependExecutorMessages(messages) {
+  const box = $("exec-timeline");
+  const anchor = box.firstChild;
+  const beforeTop = anchor ? anchor.getBoundingClientRect().top : 0;
+  const frag = document.createDocumentFragment();
+  for (const raw of messages) frag.appendChild(executorMessageNode(raw));
+  box.insertBefore(frag, anchor);
+  if (anchor) box.scrollTop += anchor.getBoundingClientRect().top - beforeTop;
+}
+
+function renderExecLiveBuffers() {
+  const box = $("exec-timeline");
+  for (const [tid, buf] of Object.entries(state.execLive)) {
+    if (!buf.reasoning && !(buf.segments || []).length) continue;
+    let el = document.getElementById(`exec-live-${tid}`);
+    if (!el) {
+      el = document.createElement("div");
+      el.id = `exec-live-${tid}`;
+      el.className = "exec-msg-assistant inflight live";
+      box.appendChild(el);
+    } else if (el.parentElement !== box) {
+      box.appendChild(el);
+    }
+    renderExecLive(el, buf, true);   // 全量重绘一次（面板打开/刷新）
+  }
+}
+
+function setIncrementalText(el, value, reset) {
+  // 帧级增量更新：只 append 新片段，避免每 token 重建整块 DOM
+  const rendered = reset ? 0 : (el._len || 0);
+  if (rendered === 0 || value.length < rendered) {
+    el.textContent = value;
+  } else if (value.length > rendered) {
+    const node = el.firstChild;
+    if (node && node.nodeType === 3) node.appendData(value.slice(rendered));
+    else el.textContent = value;
+  }
+  el._len = value.length;
+}
+
+function renderExecLive(el, buf, reset = false) {
+  // 思考默认折叠；标题实时显示"正在思考"与已产出长度，任务不会看起来卡死
+  let details = el.querySelector("details.exec-msg-reasoning");
+  if (buf.reasoning) {
+    if (!details) {
+      details = document.createElement("details");
+      details.className = "exec-msg-reasoning";
+      const sum = document.createElement("summary");
+      const pre = document.createElement("pre");
+      details.append(sum, pre);
+      el.prepend(details);
+    }
+    const pre = details.querySelector("pre");
+    setIncrementalText(pre, buf.reasoning, reset);
+    details.querySelector("summary").textContent = `正在思考… ${buf.reasoning.length} 字`;
+  } else if (details) {
+    details.remove();
+  }
+  // 分段（文本/工具/结果）：整任务累积，工具调用不清空已出现的文字
+  const segments = buf.segments || [];
+  if (!reset && (el._segCount || 0) > segments.length) reset = true;  // 服务端权威替换
+  let box = el.querySelector(".exec-live-segs");
+  if (!box) {
+    box = document.createElement("div");
+    box.className = "exec-live-segs";
+    el.appendChild(box);
+  }
+  if (reset) { box.innerHTML = ""; el._segCount = 0; el._lastTextEl = null; }
+  for (let i = el._segCount || 0; i < segments.length; i++) {
+    const seg = segments[i];
+    const node = document.createElement("div");
+    if (seg.kind === "text") {
+      node.className = "exec-live-text";
+      node.textContent = seg.text || "";
+      el._lastTextEl = node;
+    } else if (seg.kind === "tool") {
+      node.className = "exec-msg-tool";
+      node.textContent = `▸ ${seg.name} ${seg.arguments || ""}`;
+    } else {
+      node.className = "exec-msg-result";
+      node.textContent = `↳ ${seg.name}：${String(seg.result || "").slice(0, 200)}`;
+    }
+    box.appendChild(node);
+  }
+  el._segCount = segments.length;
+  const last = segments[segments.length - 1];
+  if (last && last.kind === "text" && el._lastTextEl) {
+    setIncrementalText(el._lastTextEl, last.text || "", false);  // 在途片段增量追加
+  }
+}
+
+function execLiveBuf(taskId) {
+  return state.execLive[taskId]
+    || (state.execLive[taskId] = {task_id: Number(taskId), step: 0, reasoning: "", segments: []});
+}
+
+function execAppendLiveText(taskId, text) {
+  if (taskId === undefined || taskId === null || !text) return;
+  const buf = execLiveBuf(taskId);
+  const segs = buf.segments;
+  if (segs.length && segs[segs.length - 1].kind === "text") segs[segs.length - 1].text += text;
+  else segs.push({kind: "text", text});
+  execMarkDirty(taskId);
+}
+
+function execAppendLiveReasoning(taskId, text) {
+  if (taskId === undefined || taskId === null || !text) return;
+  execLiveBuf(taskId).reasoning += text;
+  execMarkDirty(taskId);
+}
+
+function execAppendLiveTool(taskId, name, args) {
   if (taskId === undefined || taskId === null) return;
-  delete state.execLive[taskId];
-  const el = document.getElementById(`exec-live-${taskId}`);
-  if (el) el.remove();
+  execLiveBuf(taskId).segments.push({kind: "tool", name, arguments: args || ""});
+  execMarkDirty(taskId);
+}
+
+function execAppendLiveResult(taskId, name, status, result) {
+  if (taskId === undefined || taskId === null) return;
+  execLiveBuf(taskId).segments.push(
+    {kind: "result", name, status: status || "", result: result || ""});
+  execMarkDirty(taskId);
+}
+
+function execMarkDirty(taskId) {
+  state.execDirty.add(taskId);
+  if (state.execRaf) return;
+  state.execRaf = requestAnimationFrame(() => {   // 帧级批量刷新
+    state.execRaf = null;
+    const ids = [...state.execDirty];
+    state.execDirty.clear();
+    if ($("tab-executor").classList.contains("hidden")) return;  // 隐藏页签：缓冲继续累积
+    const box = $("exec-timeline");
+    const stick = shouldStickToBottom(box.scrollHeight, box.scrollTop, box.clientHeight);
+    for (const id of ids) {
+      const b = state.execLive[id];
+      if (!b) continue;
+      let el = document.getElementById(`exec-live-${id}`);
+      if (!el) {
+        el = document.createElement("div");
+        el.id = `exec-live-${id}`;
+        el.className = "exec-msg-assistant inflight live";
+        box.appendChild(el);
+      }
+      renderExecLive(el, b);
+    }
+    if (stick) box.scrollTop = box.scrollHeight;
+  });
 }
 
 function renderExecutorInflight(inflight) {

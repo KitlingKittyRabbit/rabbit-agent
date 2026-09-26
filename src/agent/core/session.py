@@ -2,12 +2,23 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
 import sqlite3
 import time
 from pathlib import Path
 
 from ..providers import Message, ToolCall
+from .events import DELTA_EVENT_TYPES
+
+_log = logging.getLogger(__name__)
+
+_SCHEMA_VERSION = 1  # user_version：事件碎片整理等一次性迁移的完成标记
+
+
+def _marks(count: int) -> str:
+    return ",".join("?" for _ in range(count))
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
@@ -119,10 +130,18 @@ def _migrate(conn: sqlite3.Connection) -> None:
 
 class SessionStore:
     def __init__(self, path: str | Path) -> None:
+        self._path = Path(path)
         self._conn = sqlite3.connect(str(path), check_same_thread=False)
         _migrate(self._conn)
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
+        # 版本门：新库/旧库做一次索引+碎片整理；已达标库跳过（常规打开零额外开销）
+        if int(self._conn.execute("PRAGMA user_version").fetchone()[0]) < _SCHEMA_VERSION:
+            self._ensure_indexes()
+            try:
+                self.compact_events()
+            except Exception:  # 整理失败：保留原库继续服务，下次启动重试
+                _log.warning("事件碎片整理失败（保留原库，下次启动重试）", exc_info=True)
 
     # ---- 会话表 ----
     def create_session(self, session_id: str, project_id: str, title: str = "") -> None:
@@ -426,14 +445,15 @@ class SessionStore:
         result: str | None = None,
         status: str | None = None,
         text: str | None = None,
-    ) -> None:
-        self._conn.execute(
+    ) -> int:
+        cur = self._conn.execute(
             "INSERT INTO execution_events (session_id, turn_id, task_id, ts, type, actor,"
             " name, arguments, result, status, text) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (session_id, turn_id, task_id, ts, type, actor, name, arguments, result, status,
              text),
         )
         self._conn.commit()
+        return int(cur.lastrowid)
 
     def list_events(
         self,
@@ -470,6 +490,188 @@ class SessionStore:
             }
             for r in rows
         ]
+
+    def list_events_page(
+        self, session_id: str, *, before_idx: int | None = None, limit: int = 2000
+    ) -> dict:
+        """事件游标分页（升序返回）：默认取最新 limit 条；before_idx 向上续载。"""
+        limit = max(1, min(int(limit), 5000))
+        if before_idx is None:
+            rows = self._conn.execute(
+                "SELECT idx, turn_id, task_id, ts, type, actor, name, arguments, result,"
+                " status, text FROM execution_events WHERE session_id = ?"
+                " ORDER BY idx DESC LIMIT ?",
+                (session_id, limit),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT idx, turn_id, task_id, ts, type, actor, name, arguments, result,"
+                " status, text FROM execution_events WHERE session_id = ? AND idx < ?"
+                " ORDER BY idx DESC LIMIT ?",
+                (session_id, int(before_idx), limit),
+            ).fetchall()
+        events = [
+            {
+                "idx": r[0], "turn_id": r[1], "task_id": r[2], "ts": r[3], "type": r[4],
+                "actor": r[5], "name": r[6], "arguments": r[7], "result": r[8],
+                "status": r[9], "text": r[10],
+            }
+            for r in reversed(rows)
+        ]
+        first = events[0]["idx"] if events else None
+        has_more = False
+        if first is not None:
+            has_more = self._conn.execute(
+                "SELECT 1 FROM execution_events WHERE session_id = ? AND idx < ? LIMIT 1",
+                (session_id, first),
+            ).fetchone() is not None
+        return {"events": events, "has_more": has_more, "before_idx": first}
+
+    def list_turns_by_ids(self, session_id: str, turn_ids: list[int]) -> list[dict]:
+        """只取给定 turn 的元数据（分页页内使用，避免整表返回）。"""
+        ids = sorted({int(t) for t in turn_ids})
+        if not ids:
+            return []
+        rows = self._conn.execute(
+            f"SELECT id, user_message, status, created_at, started_at, completed_at,"
+            f" final_text, msg_count FROM turns WHERE session_id = ? AND id IN ({_marks(len(ids))})"
+            " ORDER BY id",
+            (session_id, *ids),
+        ).fetchall()
+        return [
+            {
+                "id": r[0], "user_message": r[1], "status": r[2], "created_at": r[3],
+                "started_at": r[4], "completed_at": r[5], "final_text": r[6],
+                "msg_count": r[7],
+            }
+            for r in rows
+        ]
+
+    # ---- 事件碎片整理（旧库一次性迁移：事务化、幂等、带备份与摘要校验） ----
+
+    def _ensure_indexes(self) -> None:
+        for ddl in (
+            "CREATE INDEX IF NOT EXISTS idx_events_session_turn"
+            " ON execution_events(session_id, turn_id, idx)",
+            "CREATE INDEX IF NOT EXISTS idx_events_session_idx"
+            " ON execution_events(session_id, idx)",
+            "CREATE INDEX IF NOT EXISTS idx_events_session_task"
+            " ON execution_events(session_id, task_id, idx)",
+            "CREATE INDEX IF NOT EXISTS idx_turns_session ON turns(session_id, id)",
+            "CREATE INDEX IF NOT EXISTS idx_messages_session_stream"
+            " ON messages(session_id, stream, idx)",
+        ):
+            self._conn.execute(ddl)
+        self._conn.commit()
+
+    def _set_schema_version(self) -> None:
+        self._conn.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+        self._conn.commit()
+
+    def _backup_db(self) -> Path | None:
+        """整理前备份数据库文件（SQLite backup API，保证一致快照）。"""
+        if str(self._path) == ":memory:" or not self._path.is_file():
+            return None
+        backup = self._path.with_name(f"{self._path.name}.precompact-{int(time.time())}.bak")
+        dest = sqlite3.connect(str(backup))
+        try:
+            with dest:
+                self._conn.backup(dest)
+        finally:
+            dest.close()
+        return backup
+
+    def _count_events(self) -> int:
+        return int(self._conn.execute("SELECT COUNT(*) FROM execution_events").fetchone()[0])
+
+    def _logical_digest(self) -> str:
+        """逻辑流摘要：相邻同键 delta 按文本拼接视为一条，非 delta 事件全字段入摘要。
+
+        只对 delta 行忽略 idx/ts（合并会改变它们），用于整理前后一致性校验。
+        """
+        digest = hashlib.sha256()
+        run_key = None
+        for row in self._conn.execute(
+            "SELECT idx, turn_id, task_id, ts, type, actor, name, arguments, result,"
+            " status, text FROM execution_events ORDER BY idx"
+        ):
+            turn_id, task_id, etype, actor = row[1], row[2], row[4], row[5]
+            key = (turn_id, task_id, actor, etype) if etype in DELTA_EVENT_TYPES else None
+            if key is not None:
+                if key != run_key:
+                    digest.update(b"\x00run\x00")
+                    digest.update(json.dumps([turn_id, task_id, actor, etype]).encode())
+                digest.update((row[10] or "").encode())
+            else:
+                digest.update(b"\x00evt\x00")
+                digest.update(json.dumps(list(row), ensure_ascii=False, default=str).encode())
+            run_key = key
+        return digest.hexdigest()
+
+    def _merge_delta_runs(self) -> int:
+        """合并相邻同键 delta 行（保留首行 idx/ts，文本拼接）；返回删除行数。"""
+        rows = self._conn.execute(
+            "SELECT idx, turn_id, task_id, actor, type, text FROM execution_events ORDER BY idx"
+        ).fetchall()
+        deletes: list[tuple[int]] = []
+        run_key: tuple | None = None
+        run_first: int | None = None
+        run_parts: list[str] = []
+        removed = 0
+
+        def flush() -> None:
+            nonlocal removed
+            if run_first is None or not deletes:
+                return
+            self._conn.execute(
+                "UPDATE execution_events SET text = ? WHERE idx = ?",
+                ("".join(run_parts), run_first),
+            )
+            self._conn.executemany("DELETE FROM execution_events WHERE idx = ?", deletes)
+            removed += len(deletes)
+            deletes.clear()
+
+        for idx, turn_id, task_id, actor, etype, text in rows:
+            key = (turn_id, task_id, actor, etype) if etype in DELTA_EVENT_TYPES else None
+            if key is not None and key == run_key:
+                run_parts.append(text or "")
+                deletes.append((idx,))
+                continue
+            flush()
+            run_key = key
+            run_first = idx
+            run_parts = [text or ""] if key is not None else []
+        flush()
+        return removed
+
+    def compact_events(self) -> dict | None:
+        """旧库 delta 碎片整理：备份 → 事务合并 → 摘要校验 → 写版本标记。
+
+        - 幂等：user_version 已达标或库中没有 delta 行则跳过；
+        - 失败/中断：事务回滚，原库保持可用，下次启动重试。
+        """
+        if int(self._conn.execute("PRAGMA user_version").fetchone()[0]) >= _SCHEMA_VERSION:
+            return None
+        marks = _marks(len(DELTA_EVENT_TYPES))
+        has_delta = self._conn.execute(
+            f"SELECT 1 FROM execution_events WHERE type IN ({marks}) LIMIT 1",
+            tuple(sorted(DELTA_EVENT_TYPES)),
+        ).fetchone()
+        if has_delta is None:
+            self._set_schema_version()
+            return None
+        backup = self._backup_db()
+        before = self._count_events()
+        digest_before = self._logical_digest()
+        with self._conn:  # 事务：异常自动回滚
+            removed = self._merge_delta_runs()
+            if self._logical_digest() != digest_before:
+                raise RuntimeError("事件整理校验失败（逻辑流不一致），已回滚")
+        self._set_schema_version()
+        after = self._count_events()
+        _log.info("事件碎片整理完成：%d → %d 行（备份 %s）", before, after, backup)
+        return {"before": before, "after": after, "removed": removed,
+                "backup": str(backup) if backup else None}
 
     # ---- 消息表（stream 双流：main=指挥者 / executor=执行者，各自独立历史） ----
     def append(self, session_id: str, messages: list[Message], stream: str = "main") -> None:
@@ -547,6 +749,52 @@ class SessionStore:
                 )
             )
         return out
+
+    def load_page(
+        self, session_id: str, stream: str = "main", *, before_idx: int | None = None,
+        limit: int = 200,
+    ) -> dict:
+        """消息游标分页（升序返回）：默认最新 limit 条；before_idx 向上续载。"""
+        limit = max(1, min(int(limit), 1000))
+        cols = ("role, content, tool_calls, tool_call_id, reasoning, reasoning_field,"
+                " content_blocks")
+        if before_idx is None:
+            rows = self._conn.execute(
+                f"SELECT idx, {cols} FROM messages WHERE session_id = ? AND stream = ?"
+                " ORDER BY idx DESC LIMIT ?",
+                (session_id, stream, limit),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                f"SELECT idx, {cols} FROM messages WHERE session_id = ? AND stream = ?"
+                " AND idx < ? ORDER BY idx DESC LIMIT ?",
+                (session_id, stream, int(before_idx), limit),
+            ).fetchall()
+        out: list[dict] = []
+        for row in reversed(rows):
+            idx, role, content, calls_json, call_id, reasoning, field, blocks_json = row
+            try:
+                parsed_calls = json.loads(calls_json) if calls_json else None
+            except (ValueError, TypeError):
+                parsed_calls = None
+            out.append({
+                "idx": idx,
+                "role": role,
+                "content": content,
+                "tool_calls": [ToolCall(**tc) for tc in parsed_calls] if parsed_calls else None,
+                "tool_call_id": call_id,
+                "reasoning": reasoning,
+                "reasoning_field": field,
+                "content_blocks": self._load_blocks(blocks_json),
+            })
+        first = out[0]["idx"] if out else None
+        has_more = False
+        if first is not None:
+            has_more = self._conn.execute(
+                "SELECT 1 FROM messages WHERE session_id = ? AND stream = ? AND idx < ? LIMIT 1",
+                (session_id, stream, first),
+            ).fetchone() is not None
+        return {"messages": out, "has_more": has_more, "before_idx": first}
 
     def close(self) -> None:
         self._conn.close()

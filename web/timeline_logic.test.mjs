@@ -20,12 +20,17 @@ import {
   finalPreview,
   filterModels,
   groupActivityEvents,
+  groupEventsByTurn,
   hasWork,
   historySummary,
   inspectorLines,
   isSystemTurn,
   liveSummary,
+  mergeEventPage,
+  mergeLiveState,
   mergeTask,
+  taskCardPreview,
+  terminalEventLoaded,
   modelMenuState,
   modelSelectAction,
   pairToolEvents,
@@ -908,4 +913,72 @@ test("待绑定气泡：前缀匹配、合并消息、被并入的旧消息跳�
   assert.deepEqual(pendingBindPlan("继续做这件事", ["继续", "继续做这件事"]),
                    {skip: 1, bind: 1});
   assert.deepEqual(pendingBindPlan("测试", ["测试一下这个功能"]), {skip: 1, bind: 0});
+});
+
+test("分页事件合并：按 idx 去重，跨页边界 turn 不重复", () => {
+  const events = {};
+  const page1 = [
+    {idx: 5, turn_id: 1, type: "turn_started"},
+    {idx: 6, turn_id: 1, type: "turn_completed"},
+    {idx: 7, turn_id: 2, type: "turn_started"},
+  ];
+  const page2 = [
+    {idx: 3, turn_id: 1, type: "tool_started"},   // 边界 turn 的更早事件
+    {idx: 4, turn_id: 1, type: "tool_finished"},
+    {idx: 5, turn_id: 1, type: "turn_started"},   // 与 page1 重复
+    {idx: 2, turn_id: 1, type: "reasoning_delta"},
+  ];
+  assert.equal(mergeEventPage(events, page1), 3);
+  assert.equal(mergeEventPage(events, page2), 3);  // idx=5 已存在，不重复计
+  const groups = groupEventsByTurn(Object.values(events));
+  assert.equal(groups.length, 2);
+  assert.deepEqual(groups[0].events.map((e) => e.idx), [2, 3, 4, 5, 6]);
+  assert.equal(groups[0].turnId, 1);
+  assert.deepEqual(groups[1].events.map((e) => e.idx), [7]);
+});
+
+test("分页边界：terminalEventLoaded 判定半截状态", () => {
+  assert.equal(terminalEventLoaded([{type: "turn_started"}, {type: "tool_started"}]), false);
+  assert.equal(terminalEventLoaded([{type: "turn_started"}, {type: "turn_completed"}]), true);
+  assert.equal(terminalEventLoaded([{type: "turn_cancelled"}]), true);
+});
+
+test("实时快照合并：整任务分段累积 + 服务端权威 + 前缀取长", () => {
+  const local = {task_id: 1, step: 1, reasoning: "想",
+                 segments: [{kind: "text", text: "第一段"}]};
+  // 服务端多一段：取服务端（工具动作不会被本地旧快照吞掉）
+  const more = mergeLiveState(local, {task_id: 1, step: 1, reasoning: "想法",
+    segments: [{kind: "text", text: "第一段"}, {kind: "tool", name: "read_file"}]});
+  assert.equal(more.segments.length, 2);
+  // 本地多一段（服务端回包在途）：保留本地，不丢片段
+  const mine = mergeLiveState(
+    {task_id: 1, step: 2, reasoning: "",
+     segments: [{kind: "text", text: "a"}, {kind: "tool", name: "t"}]},
+    {task_id: 1, step: 2, reasoning: "", segments: [{kind: "text", text: "a"}]});
+  assert.equal(mine.segments.length, 2);
+  // 段数相同：文本取更长
+  const longer = mergeLiveState(
+    {task_id: 1, step: 1, reasoning: "", segments: [{kind: "text", text: "abc"}]},
+    {task_id: 1, step: 1, reasoning: "", segments: [{kind: "text", text: "ab"}]});
+  assert.equal(longer.segments[0].text, "abc");
+  // 不同任务 / 无服务端快照（退役）
+  assert.equal(mergeLiveState(local, {task_id: 9, step: 0, segments: []}).task_id, 9);
+  assert.equal(mergeLiveState(local, null), null);
+});
+
+test("任务卡预览：折叠空白并截取尾部", () => {
+  assert.equal(taskCardPreview("  多  行\n文本  "), "多 行 文本");
+  const long = "x".repeat(200);
+  const preview = taskCardPreview(long, 120);
+  assert.equal(preview.length, 121);           // 省略号 + 120 字
+  assert.ok(preview.startsWith("…"));
+  assert.equal(taskCardPreview(""), "");
+});
+
+test("任务卡包含输出预览行（主时间线不切页签可见）", () => {
+  const lines = taskCardLines({id: 1, title: "长任务", status: "running",
+                               steps_used: 2, preview: "第0段输出…"});
+  assert.equal(lines.title, "Task #1 · 长任务");
+  assert.equal(lines.preview, "第0段输出…");
+  assert.equal(taskCardLines({id: 2, title: "无输出"}).preview, "");
 });
