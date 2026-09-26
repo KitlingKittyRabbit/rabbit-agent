@@ -8,7 +8,7 @@ from agent.core.keystore import load_keys, save_key
 from agent.core.orchestrator import Orchestrator
 from agent.core.presets import PRESETS
 from agent.core.provider_store import derive_provider_id, load_registry, save_registry
-from agent.providers import AuthError, ChatResult, FakeProvider
+from agent.providers import AuthError, ChatResult, FakeProvider, Message
 from agent.providers.catalog import save_catalog
 
 
@@ -628,6 +628,50 @@ def _adjustable_entry(model_id: str, levels=("off", "low", "medium", "high"), to
         "levels": list(levels), "max_output": None, "tools": tools, "source": "provider"}}
 
 
+def _payload_capture_factory(payloads: list[dict]):
+    """真实 OpenAICompatProvider + mock completions：捕获最终请求参数（零网络）。"""
+    from types import SimpleNamespace
+
+    import httpx2
+
+    from agent.providers.openai_compat import OpenAICompatProvider
+
+    def _chunk(content=None, finish=None):
+        delta = SimpleNamespace(content=content, reasoning_content=None, tool_calls=None)
+        return SimpleNamespace(choices=[SimpleNamespace(delta=delta, finish_reason=finish)],
+                               usage=None)
+
+    class _Stream:
+        def __aiter__(self):
+            async def gen():
+                yield _chunk(content="x", finish="stop")
+            return gen()
+
+    def factory(**kw):
+        provider = OpenAICompatProvider(
+            base_url=kw["base_url"], api_key=kw["api_key"], model=kw["model"],
+            context_window=kw.get("context_window"),
+            reasoning_effort=kw.get("reasoning_effort"),
+            http_client=httpx2.AsyncClient(trust_env=False),
+        )
+
+        async def _list():
+            return [_adjustable_entry("m", ("off", "low", "high"))]
+
+        provider.list_models = _list
+
+        class _Completions:
+            async def create(self, **request):
+                payloads.append({"model": request.get("model"),
+                                 "reasoning_effort": request.get("reasoning_effort")})
+                return _Stream()
+
+        provider._client = SimpleNamespace(chat=SimpleNamespace(completions=_Completions()))
+        return provider
+
+    return factory
+
+
 async def test_role_status_keeps_explicit_efforts_none_vs_empty(tmp_path: Path) -> None:
     """未知档位必须暴露为 None（不是 []）；固定不支持时才是 []。"""
     fake = FakeProvider([ChatResult(text="pong"), ChatResult(text="pong")])
@@ -905,6 +949,70 @@ async def test_shared_provider_request_bodies_keep_their_efforts(tmp_path: Path)
     exec_payloads = [p for p in payloads if p["model"] == "m-exec"]
     assert main_payloads[-1]["reasoning_effort"] == "low"
     assert exec_payloads[-1]["reasoning_effort"] == "high"
+
+
+async def test_provider_level_connect_isolates_role_instances(tmp_path: Path) -> None:
+    """服务商级一次连接：实例独立、凭据共享、effort 互不污染（旧实现共享实例必失败）。"""
+    payloads: list[dict] = []
+    orch = make_orchestrator(tmp_path, _payload_capture_factory(payloads))
+    result = await orch.connect_provider(
+        "", protocol="openai", base_url=None, model="m", api_key="sk-shared")
+    assert result["ok"] is True, result
+
+    # 实例独立；凭据仍只有一份
+    assert orch.main_provider is not orch.executor_provider
+    assert orch.main_provider._api_key == "sk-shared"
+    assert orch.executor_provider._api_key == "sk-shared"
+    assert list(load_keys(tmp_path / "keys.json").values()) == ["sk-shared"]
+
+    # main low / executor high：状态与真实请求体一致
+    assert orch.set_reasoning_effort("main", "low")["ok"] is True
+    assert orch.set_reasoning_effort("executor", "high")["ok"] is True
+    status = orch.provider_status()["roles"]
+    assert status["main"]["effort"] == "low"
+    assert status["executor"]["effort"] == "high"
+
+    payloads.clear()
+    await orch.main_provider.chat([Message(role="user", content="hi")])
+    await orch.executor_provider.chat([Message(role="user", content="hi")])
+    assert [p["reasoning_effort"] for p in payloads] == ["low", "high"]
+
+    # 双向隔离：改 executor 不影响 main 的后续请求
+    orch.set_reasoning_effort("executor", "off")
+    payloads.clear()
+    await orch.main_provider.chat([Message(role="user", content="hi")])
+    assert payloads[-1]["reasoning_effort"] == "low"
+
+    # 双向隔离：改 main 不影响 executor 的后续请求
+    orch.set_reasoning_effort("main", "off")
+    orch.set_reasoning_effort("executor", "high")
+    payloads.clear()
+    await orch.executor_provider.chat([Message(role="user", content="hi")])
+    await orch.main_provider.chat([Message(role="user", content="hi")])
+    assert payloads[-2]["reasoning_effort"] == "high"
+    assert payloads[-1]["reasoning_effort"] is None  # main 仍 off，未被 executor 污染
+
+
+async def test_provider_level_connect_isolation_survives_restart(tmp_path: Path) -> None:
+    """重启恢复：仍是两个独立实例，后续真实请求仍分别 low/high。"""
+    payloads: list[dict] = []
+    orch = make_orchestrator(tmp_path, _payload_capture_factory(payloads))
+    assert (await orch.connect_provider(
+        "", protocol="openai", base_url=None, model="m", api_key="sk-shared"))["ok"]
+    assert orch.set_reasoning_effort("main", "low")["ok"]
+    assert orch.set_reasoning_effort("executor", "high")["ok"]
+
+    restarted: list[dict] = []
+    reopened = Orchestrator(
+        main_provider=None, executor_provider=None, root=tmp_path,
+        store_path=tmp_path / ".providers.toml", keys_path=tmp_path / "keys.json",
+        provider_factory=_payload_capture_factory(restarted),
+    )
+    assert reopened.main_provider is not None and reopened.executor_provider is not None
+    assert reopened.main_provider is not reopened.executor_provider
+    await reopened.main_provider.chat([Message(role="user", content="hi")])
+    await reopened.executor_provider.chat([Message(role="user", content="hi")])
+    assert [p["reasoning_effort"] for p in restarted] == ["low", "high"]
 
 
 async def test_missing_key_connect_returns_explicit_error(tmp_path: Path) -> None:
